@@ -151,7 +151,7 @@ In Coolify, add a **Domain** or **Proxy** for the service and point it to port *
 
 ### 8. "No available server" but container logs show Uvicorn running
 
-Coolify’s docs say this usually means **the proxy’s health check failed** – the container is marked unhealthy so the proxy doesn’t route to it. The health check often uses **curl** or **wget**; the image now includes **curl** so that check can succeed. If you deployed before that change, redeploy so the new image is used.
+Coolify’s docs say this usually means **the proxy’s health check failed** – the container is marked unhealthy so the proxy doesn’t route to it. The health check often uses **curl** or **wget**; the image now includes **curl** so that check can succeed. The health check runs **inside the container** (e.g. `curl -f http://localhost:8765/health`), so the image must include **curl**. This Dockerfile installs curl and defines a **HEALTHCHECK**. If you deployed before that change, **force a full rebuild** (e.g. Clear build cache + Redeploy) so the new image is used—a plain Redeploy reuses the old image.
 
 If the app logs show `Uvicorn running on http://0.0.0.0:8765` and deployment succeeded, but the browser still shows **no available server**:
 
