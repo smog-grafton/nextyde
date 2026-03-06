@@ -193,6 +193,12 @@ async def api_health():
     return {"telegram": "connected" if authorized else "not_logged_in", "worker": worker is not None}
 
 
+@app.get("/health")
+async def root_health():
+    """Simple 200 for proxy/load-balancer health checks. Use /api/health for full status."""
+    return {"status": "ok"}
+
+
 def _html() -> str:
     return """<!DOCTYPE html>
 <html lang="en">

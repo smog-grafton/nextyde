@@ -149,6 +149,15 @@ Mount a persistent volume so the session and DB survive restarts:
 
 In Coolify, add a **Domain** or **Proxy** for the service and point it to port **8765**. Then open `https://your-domain` and use the Web UI to paste t.me links.
 
+### 8. "No available server" but container logs show Uvicorn running
+
+If the app logs show `Uvicorn running on http://0.0.0.0:8765` and deployment succeeded, but the browser shows **no available server**, the reverse proxy (Coolify/Traefik) is not reaching the container.
+
+- **Port:** In the application’s **General** or **Deploy** settings, set the **application port** (or “Port Exposes”) to **8765** — the port the app listens on. The proxy must forward to this port.
+- **Domain / FQDN:** Ensure a **Domain** or **FQDN** is set for this application and matches the URL you use (e.g. the sslip.io URL). The proxy routes by hostname.
+- **Restart proxy:** After changing port or domain, **Restart** the application (or the proxy) so the proxy picks up the new config.
+- **From the server:** On the VPS, run `curl -s http://127.0.0.1:8765/health` (or the container IP and port if different). If that returns `{"status":"ok"}`, the app is reachable; the issue is proxy configuration.
+
 ### Summary
 
 - **Web UI:** Works with almost any channel your Telegram account can access; you just paste the message link.
