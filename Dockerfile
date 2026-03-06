@@ -5,7 +5,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
+# curl: needed for Coolify proxy health checks (avoids "no available server" when check uses curl)
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
     ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 

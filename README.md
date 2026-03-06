@@ -151,12 +151,16 @@ In Coolify, add a **Domain** or **Proxy** for the service and point it to port *
 
 ### 8. "No available server" but container logs show Uvicorn running
 
-If the app logs show `Uvicorn running on http://0.0.0.0:8765` and deployment succeeded, but the browser shows **no available server**, the reverse proxy (Coolify/Traefik) is not reaching the container.
+Coolify’s docs say this usually means **the proxy’s health check failed** – the container is marked unhealthy so the proxy doesn’t route to it. The health check often uses **curl** or **wget**; the image now includes **curl** so that check can succeed. If you deployed before that change, redeploy so the new image is used.
+
+If the app logs show `Uvicorn running on http://0.0.0.0:8765` and deployment succeeded, but the browser still shows **no available server**:
 
 - **Port:** In the application’s **General** or **Deploy** settings, set the **application port** (or “Port Exposes”) to **8765** — the port the app listens on. The proxy must forward to this port.
 - **Domain / FQDN:** Ensure a **Domain** or **FQDN** is set for this application and matches the URL you use (e.g. the sslip.io URL). The proxy routes by hostname.
 - **Restart proxy:** After changing port or domain, **Restart** the application (or the proxy) so the proxy picks up the new config.
-- **From the server:** On the VPS, run `curl -s http://127.0.0.1:8765/health` (or the container IP and port if different). If that returns `{"status":"ok"}`, the app is reachable; the issue is proxy configuration.
+- **From the server:** On the VPS, run `curl -s http://127.0.0.1:8765/health` (or the container IP and port). If that returns `{"status":"ok"}`, the app is reachable; the issue is proxy configuration. (If `curl` isn’t installed in the container, use `python3 -c "import urllib.request; print(urllib.request.urlopen('http://127.0.0.1:8765/health').read())"`.)
+- **Custom Docker Options:** Leave **Custom Docker Options** empty for this app. Options copied from other apps (e.g. `--cap-add SYS_ADMIN`, `--device=/dev/fuse`) can prevent the container from starting or joining the proxy network; clear them, Save, and Redeploy.
+- **Access without the domain:** To use the app without the proxy domain, expose the container port to the host. In Coolify, set **Port Mappings** (or equivalent) so the host publishes port 8765, e.g. `8765:8765`. Then open `http://YOUR_SERVER_IP:8765` (e.g. `http://157.173.104.218:8765`). Ensure the server firewall allows inbound TCP on 8765.
 
 ### Summary
 
