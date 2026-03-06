@@ -16,7 +16,7 @@ from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from app.config import Settings
-from app.telegram_worker import TelegramPipeWorker, JobCancelledError
+from app.telegram_worker import TelegramPipeWorker, JobCancelledError, AlreadyProcessedError
 
 LOG = logging.getLogger("telebot.web")
 jobs: dict[str, dict] = {}
@@ -81,13 +81,30 @@ async def api_process(req: ProcessRequest):
         "_ts": time.time(),
     }
 
+    def _job_message(e: Exception) -> str:
+        s = str(e).lower()
+        if "authkeyduplicated" in s or "authorization key" in s:
+            return "Telegram session in use elsewhere or invalid. Use this session only on this server and restart the app."
+        if "disconnected" in s or "cannot send requests while disconnected" in s:
+            return "Telegram disconnected. Reload the page and try again; if it persists, restart the app."
+        if "not logged in" in s:
+            return "Telegram not logged in. Restart the app after logging in with 'python main.py' once."
+        if "readerror" in s or "read error" in s:
+            return "Upload to CDN failed (connection closed). Try again."
+        return str(e)
+
     async def run():
         try:
             await worker.process_link(req.link_str, job=jobs[job_id])
-        except Exception as e:
+        except AlreadyProcessedError as e:
             jobs[job_id]["status"] = "failed"
             jobs[job_id]["error"] = str(e)
             jobs[job_id]["message"] = str(e)
+            LOG.info("Job %s skipped (already processed): %s", job_id, e)
+        except Exception as e:
+            jobs[job_id]["status"] = "failed"
+            jobs[job_id]["error"] = str(e)
+            jobs[job_id]["message"] = _job_message(e)
             LOG.exception("Job %s failed: %s", job_id, e)
 
     asyncio.create_task(run())

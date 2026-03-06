@@ -28,6 +28,10 @@ MEDIA_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm"}
 
 class JobCancelledError(Exception):
     """Raised when a job is cancelled via the web UI or API."""
+
+
+class AlreadyProcessedError(Exception):
+    """Raised when the message was already processed (success or failed) and we skip."""
 TEMP_FILE_MAX_AGE_SECONDS = 86400  # 24 hours
 TELEGRAM_LINK_PATTERN = TELEGRAM_LINK_RE
 
@@ -264,14 +268,17 @@ class TelegramPipeWorker:
                 result_holder["cdn_response"] = data.get("cdn_response")
                 result_holder["metadata"] = data.get("metadata")
 
-        await self._handle_message(
-            message,
-            catch_up=False,
-            progress_callback=cb,
-            progress_extra=progress_extra,
-        )
+        try:
+            await self._handle_message(
+                message,
+                catch_up=False,
+                progress_callback=cb,
+                progress_extra=progress_extra,
+            )
+        except AlreadyProcessedError:
+            raise
         if "cdn_response" not in result_holder:
-            raise RuntimeError("Processing did not complete (may already be processed or failed)")
+            raise RuntimeError("Processing did not complete (upload or notify failed). You can retry the same link.")
         return result_holder
 
     async def _handle_message(
@@ -289,7 +296,7 @@ class TelegramPipeWorker:
             LOGGER.debug("Skipping already processed message %s:%s", chat_id, message_id)
             if progress_callback:
                 await self._invoke_progress(progress_callback, "skipped", {"message": "Already processed"})
-            return
+            raise AlreadyProcessedError("Already processed (previous run succeeded or failed). Try another link.")
 
         async with self._sem:
             file_name = sanitize_filename(self._extract_file_name(message) or f"message_{message_id}.bin")
@@ -364,7 +371,6 @@ class TelegramPipeWorker:
                 raise
             except Exception as exc:  # noqa: BLE001
                 LOGGER.exception("Failed processing %s: %s", file_name, exc)
-                await self.store.mark_processed(chat_id, message_id, file_name, "failed", str(exc))
                 await self._invoke_progress(progress_callback, "failed", {"error": str(exc), "file_name": file_name})
                 raise
             finally:

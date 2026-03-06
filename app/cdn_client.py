@@ -64,7 +64,7 @@ class CdnClient:
                 if "application/json" in content_type:
                     return response.json()
                 return {"status": "ok", "raw": response.text}
-            except (httpx.HTTPStatusError, httpx.ConnectError, httpx.ReadTimeout) as e:
+            except (httpx.HTTPStatusError, httpx.ConnectError, httpx.ReadTimeout, httpx.ReadError, httpx.WriteError) as e:
                 last_error = e
                 if attempt < CDN_UPLOAD_MAX_ATTEMPTS:
                     delay = CDN_UPLOAD_BACKOFF_SECONDS[min(attempt - 1, len(CDN_UPLOAD_BACKOFF_SECONDS) - 1)]
@@ -91,9 +91,12 @@ class CdnClient:
         if self.settings.cdn_notify_token:
             headers["Authorization"] = f"Bearer {self.settings.cdn_notify_token}"
 
-        response = await self._client.post(
-            self.settings.cdn_notify_url,
-            headers=headers,
-            content=orjson.dumps(payload),
-        )
-        response.raise_for_status()
+        try:
+            response = await self._client.post(
+                self.settings.cdn_notify_url,
+                headers=headers,
+                content=orjson.dumps(payload),
+            )
+            response.raise_for_status()
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.ReadError) as e:
+            LOGGER.warning("Notify request failed (non-fatal): %s", e)
