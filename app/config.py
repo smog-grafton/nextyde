@@ -52,7 +52,8 @@ class Settings:
     default_category: str | None
     default_language: str | None
     default_vj: str | None
-
+    download_only: bool
+    temp_public_url: str
 
     @classmethod
     def load(cls) -> "Settings":
@@ -60,6 +61,7 @@ class Settings:
         api_hash = os.getenv("TG_API_HASH", "").strip()
         tg_phone = os.getenv("TG_PHONE", "").strip()
         cdn_upload_url = os.getenv("CDN_UPLOAD_URL", "").strip()
+        download_only = _bool("DOWNLOAD_ONLY", False)
 
         missing = []
         if not api_id:
@@ -68,7 +70,7 @@ class Settings:
             missing.append("TG_API_HASH")
         if not tg_phone:
             missing.append("TG_PHONE")
-        if not cdn_upload_url:
+        if not download_only and not cdn_upload_url:
             missing.append("CDN_UPLOAD_URL")
         if missing:
             raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
@@ -102,4 +104,6 @@ class Settings:
             default_category=os.getenv("DEFAULT_CATEGORY") or None,
             default_language=os.getenv("DEFAULT_LANGUAGE") or None,
             default_vj=os.getenv("DEFAULT_VJ") or None,
+            download_only=download_only,
+            temp_public_url=os.getenv("TEMP_PUBLIC_URL", "").strip(),
         )

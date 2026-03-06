@@ -168,6 +168,8 @@ python -m app.web
 
 3. Open **http://127.0.0.1:8765** in your browser. Paste the message link (e.g. `https://t.me/jozzmovies/45`), click **Download & ingest**. Progress is shown; when done, the file is removed locally.
 
+**Download only:** Check **Download only (get link → paste in CDN → Destroy)** to skip CDN upload. The telebot downloads the file and shows a temporary URL. Copy that URL, paste it into your CDN’s “import from URL” (source URL), and after the CDN has fetched the file, click **Destroy** to delete the temp file. Set `TEMP_PUBLIC_URL` to your telebot’s public URL (e.g. `https://teletyde.example.com`) so the link is reachable by the CDN. This avoids large uploads from telebot to CDN and works around connection limits.
+
 The optional **Channel** field is stored in your browser only (e.g. `@jozzmovies`); the **Message link** is what gets processed.
 
 ### Does the Web UI work with any channel?

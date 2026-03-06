@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
 from app.config import Settings
@@ -53,6 +53,7 @@ app = FastAPI(title="Narabox Telebot", lifespan=lifespan)
 
 class ProcessRequest(BaseModel):
     link: str
+    download_only: bool = False
 
     @property
     def link_str(self) -> str:
@@ -70,6 +71,7 @@ async def api_process(req: ProcessRequest):
     if not parse_telegram_link(req.link_str):
         raise HTTPException(422, detail="Invalid t.me URL. Use e.g. https://t.me/jozzmovies/45")
     job_id = str(uuid.uuid4())
+    download_only = req.download_only or (worker.settings.download_only if worker else False)
     jobs[job_id] = {
         "job_id": job_id,
         "status": "queued",
@@ -78,6 +80,8 @@ async def api_process(req: ProcessRequest):
         "file_name": "",
         "result": None,
         "error": None,
+        "temp_path": None,
+        "download_only": download_only,
         "_ts": time.time(),
     }
 
@@ -115,7 +119,12 @@ async def api_process(req: ProcessRequest):
 async def api_status(job_id: str):
     if job_id not in jobs:
         raise HTTPException(404, detail="Job not found")
-    return jobs[job_id]
+    j = jobs[job_id]
+    if j.get("status") == "downloaded" and j.get("temp_path") and worker:
+        base = (worker.settings.temp_public_url or "").strip()
+        if base:
+            j = {**j, "temp_url": f"{base.rstrip('/')}/api/temp/{job_id}/file"}
+    return j
 
 
 @app.post("/api/cancel")
@@ -127,6 +136,49 @@ async def api_cancel(job_id: str):
         return {"ok": True, "message": "Job already finished"}
     j["cancelled"] = True
     return {"ok": True, "message": "Cancel requested"}
+
+
+@app.get("/api/temp/{job_id}/file")
+async def api_temp_file(job_id: str):
+    """Serve the downloaded file so the CDN (or you) can fetch it by URL. Only for jobs in 'downloaded' state."""
+    if job_id not in jobs:
+        raise HTTPException(404, detail="Job not found")
+    j = jobs[job_id]
+    if j.get("status") != "downloaded":
+        raise HTTPException(404, detail="File not available (wrong status)")
+    path = j.get("temp_path")
+    if not path or not Path(path).is_file():
+        raise HTTPException(404, detail="File not found or already destroyed")
+    return FileResponse(path, filename=j.get("file_name") or Path(path).name, media_type="application/octet-stream")
+
+
+@app.post("/api/destroy/{job_id}")
+async def api_destroy(job_id: str):
+    """Delete the temp file for this job after you have imported it to the CDN. Call once CDN has fetched the file."""
+    if job_id not in jobs:
+        raise HTTPException(404, detail="Job not found")
+    j = jobs[job_id]
+    if j.get("status") == "destroyed":
+        return {"ok": True, "message": "Already destroyed"}
+    if j.get("status") != "downloaded":
+        raise HTTPException(400, detail="Only downloaded files can be destroyed")
+    path = Path(j.get("temp_path") or "")
+    if path.is_file():
+        try:
+            path.unlink()
+        except OSError as e:
+            raise HTTPException(500, detail=f"Could not delete file: {e}") from e
+    parent = path.parent
+    if parent.is_dir() and str(parent) != ".":
+        try:
+            parent.rmdir()
+        except OSError:
+            pass
+    j["status"] = "destroyed"
+    j["message"] = "File deleted."
+    j["temp_path"] = None
+    j["temp_url"] = None
+    return {"ok": True, "message": "File deleted"}
 
 
 @app.get("/api/jobs")
@@ -213,6 +265,9 @@ def _html() -> str:
     .btn-danger { background: #dc3545; }
     .btn-danger:hover { background: #c82333; }
     .btn-sm { padding: 0.4rem 0.8rem; font-size: 0.9rem; width: auto; }
+    .checkbox-label { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem; font-weight: normal; }
+    .checkbox-label input { width: auto; margin: 0; }
+    .temp-url-box { margin: 0.5rem 0; padding: 0.5rem; background: #f0f0f0; border-radius: 4px; font-size: 0.85rem; word-break: break-all; }
     #serverStatus { font-size: 0.85rem; color: #666; margin-bottom: 1rem; }
     #serverStatus.connected { color: #198754; }
     #serverStatus.disconnected { color: #dc3545; }
@@ -225,12 +280,14 @@ def _html() -> str:
     .jobs-list .badge.failed { background: #f8d7da; color: #842029; }
     .jobs-list .badge.cancelled { background: #e9ecef; color: #495057; }
     .jobs-list .badge.running { background: #cce5ff; color: #004085; }
+    .jobs-list .badge.downloaded { background: #cce5ff; color: #004085; }
+    .jobs-list .badge.destroyed { background: #e9ecef; color: #495057; }
   </style>
 </head>
 <body>
   <h1>Narabox Telebot</h1>
   <p id="serverStatus" class="muted">Checking…</p>
-  <p class="muted">Paste a Telegram message link. The file will be downloaded, sent to your CDN, then deleted locally.</p>
+  <p class="muted">Paste a Telegram message link. With <strong>Download only</strong>: get a link to the file, paste it in the CDN import, then click Destroy.</p>
   <form id="form">
     <label for="channel">Channel (saved in browser)</label>
     <input type="text" id="channel" name="channel" placeholder="@jozzmovies">
@@ -238,6 +295,7 @@ def _html() -> str:
     <label for="link">Message link</label>
     <input type="url" id="link" name="link" placeholder="https://t.me/jozzmovies/45" required>
     <p class="channel-hint">Paste a t.me link like <code>https://t.me/channelname/123</code> (message must contain a video).</p>
+    <label class="checkbox-label"><input type="checkbox" id="downloadOnly" name="download_only"> Download only (get link → paste in CDN → Destroy)</label>
     <button type="submit" id="btn">Download &amp; ingest</button>
   </form>
   <div id="status"></div>
@@ -282,7 +340,8 @@ def _html() -> str:
         const list = await r.json();
         jobsListEl.innerHTML = list.length === 0 ? '<li class="muted">No jobs yet</li>' : list.map(function(j) {
           var label = j.file_name || j.message || j.job_id.slice(0, 8);
-          var badge = '<span class="badge ' + (j.status === 'done' ? 'done' : j.status === 'failed' ? 'failed' : j.status === 'cancelled' ? 'cancelled' : 'running') + '">' + j.status + '</span>';
+          var badgeClass = j.status === 'done' ? 'done' : j.status === 'failed' ? 'failed' : j.status === 'cancelled' ? 'cancelled' : j.status === 'downloaded' ? 'downloaded' : j.status === 'destroyed' ? 'destroyed' : 'running';
+          var badge = '<span class="badge ' + badgeClass + '">' + j.status + '</span>';
           return '<li><span title="' + escapeHtml(j.job_id) + '">' + escapeHtml(String(label).slice(0, 50)) + '</span>' + badge + '</li>';
         }).join('');
       } catch (_) {}
@@ -315,14 +374,28 @@ def _html() -> str:
           let html = '<p><strong>' + (j.message || j.status) + '</strong></p>';
           if (j.file_name) html += '<p class="muted">' + escapeHtml(j.file_name) + '</p>';
           html += '<div class="bar"><div class="bar-fill" style="width:' + pct + '%"></div></div>';
-          html += '<div class="status-actions">';
-          if (canCancel) html += '<button type="button" class="btn-danger btn-sm" data-action="cancel" data-job-id="' + escapeHtml(jobId) + '">Cancel</button>';
-          html += '<button type="button" class="btn-secondary btn-sm" data-action="clear">Clear</button></div>';
-          var statusClass = j.status === 'failed' ? 'failed' : j.status === 'done' ? 'done' : j.status === 'cancelled' ? 'cancelled' : '';
+          if (j.status === 'downloaded') {
+            if (j.temp_url) {
+              html += '<p class="muted">Paste this URL in CDN import (source URL), then click Destroy after the CDN has fetched it.</p>';
+              html += '<div class="temp-url-box"><code id="tempUrlRef">' + escapeHtml(j.temp_url) + '</code></div>';
+              html += '<div class="status-actions"><button type="button" class="btn-secondary btn-sm" data-action="copy-temp" data-job-id="' + escapeHtml(jobId) + '">Copy link</button><button type="button" class="btn-danger btn-sm" data-action="destroy" data-job-id="' + escapeHtml(jobId) + '">Destroy</button><button type="button" class="btn-secondary btn-sm" data-action="clear">Clear</button></div>';
+            } else {
+              html += '<p class="muted">Set TEMP_PUBLIC_URL on the server to get the link. Path: ' + escapeHtml(j.temp_path || '') + '</p>';
+              html += '<div class="status-actions"><button type="button" class="btn-danger btn-sm" data-action="destroy" data-job-id="' + escapeHtml(jobId) + '">Destroy</button><button type="button" class="btn-secondary btn-sm" data-action="clear">Clear</button></div>';
+            }
+          } else {
+            html += '<div class="status-actions">';
+            if (canCancel) html += '<button type="button" class="btn-danger btn-sm" data-action="cancel" data-job-id="' + escapeHtml(jobId) + '">Cancel</button>';
+            html += '<button type="button" class="btn-secondary btn-sm" data-action="clear">Clear</button></div>';
+          }
+          var statusClass = j.status === 'failed' ? 'failed' : j.status === 'done' ? 'done' : j.status === 'cancelled' ? 'cancelled' : j.status === 'downloaded' ? 'done' : '';
           showStatus(html, statusClass);
           if (j.status === 'done') {
             if (j.result && j.result.asset_id) html += '<p class="muted">Asset: ' + escapeHtml(j.result.asset_id) + '</p>';
             showStatus(statusEl.innerHTML, 'done');
+            stopPolling();
+          }
+          if (j.status === 'downloaded') {
             stopPolling();
           }
           if (j.status === 'failed') {
@@ -353,6 +426,20 @@ def _html() -> str:
       if (target.dataset.action === 'cancel' && target.dataset.jobId) {
         fetch('/api/cancel?job_id=' + encodeURIComponent(target.dataset.jobId), { method: 'POST' }).then(function() {});
       }
+      if (target.dataset.action === 'copy-temp') {
+        var code = document.getElementById('tempUrlRef');
+        if (code) {
+          navigator.clipboard.writeText(code.textContent).then(function() { target.textContent = 'Copied!'; });
+        }
+      }
+      if (target.dataset.action === 'destroy' && target.dataset.jobId) {
+        fetch('/api/destroy/' + encodeURIComponent(target.dataset.jobId), { method: 'POST' }).then(function(r) { return r.json(); }).then(function(data) {
+          if (data.ok) {
+            showStatus('<p><strong>File deleted.</strong></p><div class="status-actions"><button type="button" class="btn-secondary btn-sm" data-action="clear">Clear</button></div>', '');
+            refreshJobs();
+          }
+        });
+      }
       if (target.dataset.action === 'clear') {
         showStatus('', '');
         statusEl.style.display = 'none';
@@ -366,10 +453,11 @@ def _html() -> str:
       btn.disabled = true;
       showStatus('<p>Starting…</p>', '');
       try {
+        const downloadOnly = document.getElementById('downloadOnly').checked;
         const r = await fetch('/api/process', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ link })
+          body: JSON.stringify({ link: link, download_only: downloadOnly })
         });
         if (!r.ok) {
           const err = await r.json().catch(() => ({ detail: r.statusText }));

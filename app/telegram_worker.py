@@ -257,6 +257,10 @@ class TelegramPipeWorker:
                     job["message"] = "Done. File deleted."
                     job["progress_pct"] = 100
                     job["result"] = data.get("cdn_response")
+                elif status == "downloaded":
+                    job["message"] = "Ready. Copy the link, paste in CDN import, then click Destroy."
+                    job["progress_pct"] = 100
+                    job["temp_path"] = data.get("temp_path", "")
                 elif status == "failed":
                     job["message"] = data.get("error", "Failed")
                     job["error"] = data.get("error")
@@ -267,6 +271,8 @@ class TelegramPipeWorker:
             if status == "done" and data:
                 result_holder["cdn_response"] = data.get("cdn_response")
                 result_holder["metadata"] = data.get("metadata")
+            if status == "downloaded" and data:
+                result_holder["temp_path"] = data.get("temp_path")
 
         try:
             await self._handle_message(
@@ -277,6 +283,8 @@ class TelegramPipeWorker:
             )
         except AlreadyProcessedError:
             raise
+        if result_holder.get("temp_path"):
+            return result_holder
         if "cdn_response" not in result_holder:
             raise RuntimeError("Processing did not complete (upload or notify failed). You can retry the same link.")
         return result_holder
@@ -300,7 +308,13 @@ class TelegramPipeWorker:
 
         async with self._sem:
             file_name = sanitize_filename(self._extract_file_name(message) or f"message_{message_id}.bin")
-            temp_file = self.settings.temp_dir / file_name
+            download_only = progress_extra is not None and progress_extra.get("download_only") is True
+            if download_only and progress_extra and progress_extra.get("job_id"):
+                job_dir = self.settings.temp_dir / str(progress_extra["job_id"])
+                job_dir.mkdir(parents=True, exist_ok=True)
+                temp_file = job_dir / file_name
+            else:
+                temp_file = self.settings.temp_dir / file_name
             metadata = extract_metadata(file_name)
             metadata.update(
                 {
@@ -338,30 +352,38 @@ class TelegramPipeWorker:
 
                 if progress_extra is not None and progress_extra.get("cancelled"):
                     raise JobCancelledError("Job cancelled")
-                await self._invoke_progress(progress_callback, "uploading", {"file_name": file_name})
-                LOGGER.info("Uploading %s to CDN", file_name)
-                cdn_response = await self.cdn.upload_file(temp_file, metadata)
-                cdn_payload = cdn_response.get("data", cdn_response) if isinstance(cdn_response, dict) else cdn_response
-                await self.store.mark_processed(
-                    chat_id,
-                    message_id,
-                    file_name,
-                    "uploaded",
-                    orjson.dumps(cdn_response).decode("utf-8"),
-                )
-                await self.cdn.notify(
-                    {
-                        "status": "uploaded",
-                        "telegram": metadata,
-                        "cdn_response": cdn_payload,
-                    }
-                )
-                await self._invoke_progress(
-                    progress_callback,
-                    "done",
-                    {"cdn_response": cdn_payload, "metadata": metadata, "file_name": file_name},
-                )
-                LOGGER.info("Finished %s", file_name)
+                if download_only:
+                    await self._invoke_progress(
+                        progress_callback,
+                        "downloaded",
+                        {"temp_path": str(temp_file), "file_name": file_name, "metadata": metadata},
+                    )
+                    LOGGER.info("Download only: %s ready at %s", file_name, temp_file)
+                else:
+                    await self._invoke_progress(progress_callback, "uploading", {"file_name": file_name})
+                    LOGGER.info("Uploading %s to CDN", file_name)
+                    cdn_response = await self.cdn.upload_file(temp_file, metadata)
+                    cdn_payload = cdn_response.get("data", cdn_response) if isinstance(cdn_response, dict) else cdn_response
+                    await self.store.mark_processed(
+                        chat_id,
+                        message_id,
+                        file_name,
+                        "uploaded",
+                        orjson.dumps(cdn_response).decode("utf-8"),
+                    )
+                    await self.cdn.notify(
+                        {
+                            "status": "uploaded",
+                            "telegram": metadata,
+                            "cdn_response": cdn_payload,
+                        }
+                    )
+                    await self._invoke_progress(
+                        progress_callback,
+                        "done",
+                        {"cdn_response": cdn_payload, "metadata": metadata, "file_name": file_name},
+                    )
+                    LOGGER.info("Finished %s", file_name)
             except JobCancelledError:
                 LOGGER.info("Job cancelled: %s", file_name)
                 await self._invoke_progress(progress_callback, "cancelled", {"file_name": file_name})
@@ -374,7 +396,7 @@ class TelegramPipeWorker:
                 await self._invoke_progress(progress_callback, "failed", {"error": str(exc), "file_name": file_name})
                 raise
             finally:
-                if self.settings.delete_after_upload:
+                if not download_only and self.settings.delete_after_upload:
                     try:
                         temp_file.unlink(missing_ok=True)
                     except Exception:  # noqa: BLE001
