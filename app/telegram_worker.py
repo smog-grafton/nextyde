@@ -23,7 +23,7 @@ from app.filename import extract_metadata, sanitize_filename
 from app.link_parser import TELEGRAM_LINK_RE
 
 LOGGER = logging.getLogger("telebot")
-MEDIA_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm}
+MEDIA_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm"}
 
 
 class JobCancelledError(Exception):
