@@ -14,5 +14,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Default: run channel watcher. For web-only deploy use: CMD ["python", "-m", "app.web"]
-CMD ["python", "main.py"]
+# Default: run Web UI (browser access on PORT/8765). For watcher-only, override with: python main.py
+ENV PORT=8765
+EXPOSE 8765
+CMD ["python", "-m", "app.web"]

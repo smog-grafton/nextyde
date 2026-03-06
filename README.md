@@ -114,12 +114,8 @@ Set `TG_SESSION_NAME` in Coolify env to the same name you used locally (e.g. `na
    - **Build Pack:** Dockerfile (use the repo’s `Dockerfile`).
    - Or leave Coolify to detect the Dockerfile.
 4. **Deploy:**
-   - **Port:** For Web UI use `8765` (the app listens on `0.0.0.0:8765`). For channel watcher only, you don’t need to expose a port.
-   - **Start command (optional):** To run **only the Web UI** in production, override the start command to:
-     ```bash
-     python -m app.web
-     ```
-     Otherwise the default `CMD` in the Dockerfile runs `main.py` (channel watcher).
+   - **Port:** Set to `8765`. The Dockerfile **default is the Web UI** (`python -m app.web`), so the app will listen on `0.0.0.0:8765` with no start-command override.
+   - **Start command:** Leave empty. The image already runs the Web UI by default. If you ever want the **channel watcher** instead (no browser), use Coolify’s **Custom Docker Options** (General tab) to override the command (e.g. `--entrypoint python` and container command `main.py`; syntax depends on your Coolify version).
 
 ### 5. Environment variables in Coolify
 
@@ -138,7 +134,7 @@ Add all required env vars in Coolify’s **Environment Variables** for this serv
 | `CDN_NOTIFY_TOKEN` | No | TELEGRAM_INGEST_NOTIFY_TOKEN from portal |
 | `TEMP_DIR` | No | /tmp/telebot |
 | `DB_PATH` | No | /data/telebot_state.db (use a path on a persistent volume) |
-| `PORT` | No (default 8765) | Set by Coolify for Web UI; use when overriding start to `python -m app.web` |
+| `PORT` | No (default 8765) | Web UI port; set in Coolify if your host port mapping differs |
 
 For **Web UI only**, you can leave `TG_WATCH_TARGETS` and `TG_JOIN_TARGETS` empty.
 
