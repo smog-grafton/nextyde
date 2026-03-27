@@ -16,6 +16,7 @@ from fastapi.responses import HTMLResponse, FileResponse
 from pydantic import BaseModel
 
 from app.config import Settings
+from app.media_tools import detect_media_tools
 from app.telegram_worker import TelegramPipeWorker, JobCancelledError, AlreadyProcessedError
 
 LOG = logging.getLogger("telebot.web")
@@ -190,7 +191,19 @@ async def api_jobs(limit: int = 20):
 
 @app.get("/api/health")
 async def api_health():
-    return {"telegram": "connected" if authorized else "not_logged_in", "worker": worker is not None}
+    tools = detect_media_tools()
+    return {
+        "telegram": "connected" if authorized else "not_logged_in",
+        "worker": worker is not None,
+        "ffmpeg_available": tools.ffmpeg.available,
+        "ffprobe_available": tools.ffprobe.available,
+        "ffmpeg_path": tools.ffmpeg.path,
+        "ffprobe_path": tools.ffprobe.path,
+        "ffmpeg_version": tools.ffmpeg.version,
+        "ffprobe_version": tools.ffprobe.version,
+        "ffmpeg_error": tools.ffmpeg.error,
+        "ffprobe_error": tools.ffprobe.error,
+    }
 
 
 @app.get("/health")

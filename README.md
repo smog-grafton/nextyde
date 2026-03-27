@@ -12,6 +12,7 @@ For large movie files, a normal Bot API bot is a bad fit. The Bot API download l
 - Optionally auto-joins channels on startup
 - Catches up on the last N messages on boot
 - Downloads supported video files to a temp directory
+- Probes downloaded media with ffprobe and prepares a delivery-optimized MP4 when needed
 - Extracts basic metadata from filenames like `28 YEARS LATER=1 VJ JOZZ UG.mkv`
 - Uploads the file to your CDN over HTTP
 - Records processed Telegram message IDs in SQLite so duplicates are skipped
@@ -76,7 +77,28 @@ CDN_API_TOKEN=replace_me
 CDN_NOTIFY_URL=https://portal.naraboxtv.com/api/telegram/ingest-notify
 CDN_NOTIFY_TOKEN=replace_me
 DEFAULT_CATEGORY=movies
+VIDEO_PREP_ENABLED=true
+VIDEO_PREP_MAX_HEIGHT=720
+VIDEO_PREP_CRF=22
+VIDEO_PREP_PRESET=medium
+VIDEO_PREP_MIN_SIZE_MB_FOR_TRANSCODE=50
+VIDEO_PREP_KEEP_ORIGINAL_ON_SUCCESS=false
+VIDEO_PREP_TIMEOUT_SECONDS=7200
+FFMPEG_BINARY=
+FFPROBE_BINARY=
 ```
+
+### Video preparation behavior
+
+After Telegram download, the worker:
+
+- Detects `ffmpeg`/`ffprobe` at runtime (env override first, then `PATH`, with `-version` validation)
+- Probes source media and decides whether to keep source or transcode
+- Transcodes to MP4 with `libx264` + `aac` + `+faststart` when needed
+- Keeps only primary video and first audio stream (`-map 0:v:0 -map 0:a:0?`)
+- Downscales oversized sources to a max height (default `720`) without upscaling
+
+If video prep is enabled but media tools are missing or transcoding fails, the job fails with a clear error so issues are visible in production logs/UI.
 
 ## Deploy on VPS (Coolify)
 

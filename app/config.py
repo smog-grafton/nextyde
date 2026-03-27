@@ -54,6 +54,15 @@ class Settings:
     default_vj: str | None
     download_only: bool
     temp_public_url: str
+    ffmpeg_binary: str | None
+    ffprobe_binary: str | None
+    video_prep_enabled: bool
+    video_prep_max_height: int
+    video_prep_crf: int
+    video_prep_preset: str
+    video_prep_min_size_mb_for_transcode: int
+    video_prep_keep_original_on_success: bool
+    video_prep_timeout_seconds: int
 
     @classmethod
     def load(cls) -> "Settings":
@@ -106,4 +115,13 @@ class Settings:
             default_vj=os.getenv("DEFAULT_VJ") or None,
             download_only=download_only,
             temp_public_url=os.getenv("TEMP_PUBLIC_URL", "").strip(),
+            ffmpeg_binary=(os.getenv("FFMPEG_BINARY") or "").strip() or None,
+            ffprobe_binary=(os.getenv("FFPROBE_BINARY") or "").strip() or None,
+            video_prep_enabled=_bool("VIDEO_PREP_ENABLED", True),
+            video_prep_max_height=max(240, int(os.getenv("VIDEO_PREP_MAX_HEIGHT", "720"))),
+            video_prep_crf=min(35, max(16, int(os.getenv("VIDEO_PREP_CRF", "22")))),
+            video_prep_preset=(os.getenv("VIDEO_PREP_PRESET", "medium").strip() or "medium"),
+            video_prep_min_size_mb_for_transcode=max(1, int(os.getenv("VIDEO_PREP_MIN_SIZE_MB_FOR_TRANSCODE", "50"))),
+            video_prep_keep_original_on_success=_bool("VIDEO_PREP_KEEP_ORIGINAL_ON_SUCCESS", False),
+            video_prep_timeout_seconds=max(60, int(os.getenv("VIDEO_PREP_TIMEOUT_SECONDS", "7200"))),
         )

@@ -21,6 +21,8 @@ from app.config import Settings
 from app.db import StateStore
 from app.filename import extract_metadata, sanitize_filename
 from app.link_parser import TELEGRAM_LINK_RE
+from app.media_tools import detect_media_tools
+from app.video_prepare import prepare_video_for_delivery
 
 LOGGER = logging.getLogger("telebot")
 MEDIA_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm"}
@@ -55,6 +57,13 @@ class TelegramPipeWorker:
         await self.store.init()
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
         self._cleanup_old_temp_files()
+        if self.settings.video_prep_enabled:
+            tools = detect_media_tools()
+            LOGGER.info(
+                "Video prep tools at startup: ffmpeg=%s ffprobe=%s",
+                "ready" if tools.ffmpeg.available else f"missing ({tools.ffmpeg.error})",
+                "ready" if tools.ffprobe.available else f"missing ({tools.ffprobe.error})",
+            )
         await self.client.connect()
 
         if not await self.client.is_user_authorized():
@@ -352,22 +361,72 @@ class TelegramPipeWorker:
 
                 if progress_extra is not None and progress_extra.get("cancelled"):
                     raise JobCancelledError("Job cancelled")
+                delivery_file = temp_file
+                if self.settings.video_prep_enabled:
+                    prep_result = prepare_video_for_delivery(self.settings, temp_file)
+                    delivery_file = prep_result.delivery_path
+                    metadata.update(
+                        {
+                            "video_prep_applied": prep_result.changed,
+                            "video_prep_reason": prep_result.decision.reason,
+                            "video_prep_input_size": prep_result.source_size_bytes,
+                            "video_prep_output_size": prep_result.output_size_bytes,
+                            "video_prep_profile": {
+                                "codec": "libx264",
+                                "audio_codec": "aac",
+                                "crf": self.settings.video_prep_crf,
+                                "preset": self.settings.video_prep_preset,
+                                "max_height": self.settings.video_prep_max_height,
+                                "faststart": True,
+                            },
+                            "video_codec_out": (
+                                prep_result.output_probe.video.codec
+                                if prep_result.output_probe and prep_result.output_probe.video
+                                else (prep_result.source_probe.video.codec if prep_result.source_probe.video else None)
+                            ),
+                            "audio_codec_out": (
+                                prep_result.output_probe.audio.codec
+                                if prep_result.output_probe and prep_result.output_probe.audio
+                                else (prep_result.source_probe.audio.codec if prep_result.source_probe.audio else None)
+                            ),
+                            "video_width_out": (
+                                prep_result.output_probe.video.width
+                                if prep_result.output_probe and prep_result.output_probe.video
+                                else (prep_result.source_probe.video.width if prep_result.source_probe.video else None)
+                            ),
+                            "video_height_out": (
+                                prep_result.output_probe.video.height
+                                if prep_result.output_probe and prep_result.output_probe.video
+                                else (prep_result.source_probe.video.height if prep_result.source_probe.video else None)
+                            ),
+                        }
+                    )
+                    if prep_result.changed and not self.settings.video_prep_keep_original_on_success:
+                        try:
+                            if temp_file != delivery_file and temp_file.is_file():
+                                temp_file.unlink()
+                                LOGGER.info(
+                                    "Video prep cleanup: removed source file after optimization: %s",
+                                    temp_file,
+                                )
+                        except OSError as exc:
+                            LOGGER.warning("Could not remove source file after video prep: %s", exc)
                 if download_only:
                     await self._invoke_progress(
                         progress_callback,
                         "downloaded",
-                        {"temp_path": str(temp_file), "file_name": file_name, "metadata": metadata},
+                        {"temp_path": str(delivery_file), "file_name": delivery_file.name, "metadata": metadata},
                     )
-                    LOGGER.info("Download only: %s ready at %s", file_name, temp_file)
+                    LOGGER.info("Download only: %s ready at %s", delivery_file.name, delivery_file)
                 else:
-                    await self._invoke_progress(progress_callback, "uploading", {"file_name": file_name})
-                    LOGGER.info("Uploading %s to CDN", file_name)
-                    cdn_response = await self.cdn.upload_file(temp_file, metadata)
+                    await self._invoke_progress(progress_callback, "uploading", {"file_name": delivery_file.name})
+                    LOGGER.info("Uploading %s to CDN", delivery_file.name)
+                    cdn_response = await self.cdn.upload_file(delivery_file, metadata)
                     cdn_payload = cdn_response.get("data", cdn_response) if isinstance(cdn_response, dict) else cdn_response
                     await self.store.mark_processed(
                         chat_id,
                         message_id,
-                        file_name,
+                        delivery_file.name,
                         "uploaded",
                         orjson.dumps(cdn_response).decode("utf-8"),
                     )
@@ -381,9 +440,9 @@ class TelegramPipeWorker:
                     await self._invoke_progress(
                         progress_callback,
                         "done",
-                        {"cdn_response": cdn_payload, "metadata": metadata, "file_name": file_name},
+                        {"cdn_response": cdn_payload, "metadata": metadata, "file_name": delivery_file.name},
                     )
-                    LOGGER.info("Finished %s", file_name)
+                    LOGGER.info("Finished %s", delivery_file.name)
             except JobCancelledError:
                 LOGGER.info("Job cancelled: %s", file_name)
                 await self._invoke_progress(progress_callback, "cancelled", {"file_name": file_name})
@@ -401,6 +460,12 @@ class TelegramPipeWorker:
                         temp_file.unlink(missing_ok=True)
                     except Exception:  # noqa: BLE001
                         LOGGER.warning("Could not delete temp file: %s", temp_file)
+                    optimized_temp_file = temp_file.with_name(f"{temp_file.stem}.delivery.mp4")
+                    if optimized_temp_file != temp_file:
+                        try:
+                            optimized_temp_file.unlink(missing_ok=True)
+                        except Exception:  # noqa: BLE001
+                            LOGGER.warning("Could not delete optimized temp file: %s", optimized_temp_file)
 
     async def _invoke_progress(
         self,
