@@ -10,6 +10,7 @@ import time
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, FileResponse
@@ -23,6 +24,47 @@ LOG = logging.getLogger("telebot.web")
 jobs: dict[str, dict] = {}
 worker: TelegramPipeWorker | None = None
 authorized = False
+
+
+def _job_with_temp_url(job: dict, current_worker: TelegramPipeWorker | None) -> dict:
+    out = dict(job)
+    if not current_worker:
+        return out
+    temp_path = out.get("temp_path")
+    if not temp_path:
+        return out
+    base = (current_worker.settings.temp_public_url or "").strip()
+    if base:
+        out["temp_url"] = f"{base.rstrip('/')}/api/temp/{quote(str(out.get('job_id', '')))}" + "/file"
+    return out
+
+
+def _recover_download_only_jobs(current_worker: TelegramPipeWorker) -> int:
+    recovered = 0
+    for child in current_worker.settings.temp_dir.iterdir():
+        if not child.is_dir():
+            continue
+        job_id = child.name
+        if job_id in jobs:
+            continue
+        files = [p for p in child.iterdir() if p.is_file()]
+        if not files:
+            continue
+        latest = max(files, key=lambda p: p.stat().st_mtime)
+        jobs[job_id] = {
+            "job_id": job_id,
+            "status": "downloaded",
+            "progress_pct": 100,
+            "message": "Recovered after restart. Ready for CDN fetch or destroy.",
+            "file_name": latest.name,
+            "result": None,
+            "error": None,
+            "temp_path": str(latest),
+            "download_only": True,
+            "_ts": latest.stat().st_mtime,
+        }
+        recovered += 1
+    return recovered
 
 
 @asynccontextmanager
@@ -40,6 +82,9 @@ async def lifespan(app: FastAPI):
         else:
             me = await worker.client.get_me()
             LOG.info("Web app ready. Signed in as %s", getattr(me, "username", me.id))
+        recovered = _recover_download_only_jobs(worker)
+        if recovered:
+            LOG.info("Recovered %s download-only job(s) from temp storage", recovered)
     except Exception as e:
         LOG.exception("Startup failed: %s", e)
         authorized = False
@@ -120,12 +165,7 @@ async def api_process(req: ProcessRequest):
 async def api_status(job_id: str):
     if job_id not in jobs:
         raise HTTPException(404, detail="Job not found")
-    j = jobs[job_id]
-    if j.get("status") == "downloaded" and j.get("temp_path") and worker:
-        base = (worker.settings.temp_public_url or "").strip()
-        if base:
-            j = {**j, "temp_url": f"{base.rstrip('/')}/api/temp/{job_id}/file"}
-    return j
+    return _job_with_temp_url(jobs[job_id], worker)
 
 
 @app.post("/api/cancel")
@@ -145,7 +185,9 @@ async def api_temp_file(job_id: str):
     if job_id not in jobs:
         raise HTTPException(404, detail="Job not found")
     j = jobs[job_id]
-    if j.get("status") != "downloaded":
+    if not j.get("temp_path"):
+        raise HTTPException(404, detail="File not available for this job")
+    if j.get("status") not in {"downloaded", "failed"}:
         raise HTTPException(404, detail="File not available (wrong status)")
     path = j.get("temp_path")
     if not path or not Path(path).is_file():
@@ -161,8 +203,8 @@ async def api_destroy(job_id: str):
     j = jobs[job_id]
     if j.get("status") == "destroyed":
         return {"ok": True, "message": "Already destroyed"}
-    if j.get("status") != "downloaded":
-        raise HTTPException(400, detail="Only downloaded files can be destroyed")
+    if not j.get("temp_path"):
+        raise HTTPException(400, detail="No temp file recorded for this job")
     path = Path(j.get("temp_path") or "")
     if path.is_file():
         try:
@@ -186,7 +228,7 @@ async def api_destroy(job_id: str):
 async def api_jobs(limit: int = 20):
     """List recent jobs (newest first)."""
     order = sorted(jobs.items(), key=lambda x: x[1].get("_ts", 0), reverse=True)
-    return [v for _, v in order[:limit]]
+    return [_job_with_temp_url(v, worker) for _, v in order[:limit]]
 
 
 @app.get("/api/health")
@@ -361,7 +403,14 @@ def _html() -> str:
           var label = j.file_name || j.message || j.job_id.slice(0, 8);
           var badgeClass = j.status === 'done' ? 'done' : j.status === 'failed' ? 'failed' : j.status === 'cancelled' ? 'cancelled' : j.status === 'downloaded' ? 'downloaded' : j.status === 'destroyed' ? 'destroyed' : 'running';
           var badge = '<span class="badge ' + badgeClass + '">' + j.status + '</span>';
-          return '<li><span title="' + escapeHtml(j.job_id) + '">' + escapeHtml(String(label).slice(0, 50)) + '</span>' + badge + '</li>';
+          var actions = '';
+          if (j.temp_path) {
+            if (j.temp_url) {
+              actions += '<button type="button" class="btn-secondary btn-sm" data-action="copy-temp-url" data-temp-url="' + escapeHtml(j.temp_url) + '">Copy URL</button>';
+            }
+            actions += '<button type="button" class="btn-danger btn-sm" data-action="destroy" data-job-id="' + escapeHtml(j.job_id) + '">Destroy</button>';
+          }
+          return '<li><span title="' + escapeHtml(j.job_id) + '">' + escapeHtml(String(label).slice(0, 50)) + '</span><span>' + badge + actions + '</span></li>';
         }).join('');
       } catch (_) {}
     }
@@ -389,7 +438,7 @@ def _html() -> str:
           const r = await fetch('/api/status?job_id=' + encodeURIComponent(jobId));
           const j = await r.json();
           const pct = j.progress_pct ?? 0;
-          const canCancel = ['queued', 'starting', 'downloading', 'uploading'].indexOf(j.status) >= 0;
+          const canCancel = ['queued', 'starting', 'downloading', 'preparing', 'uploading'].indexOf(j.status) >= 0;
           let html = '<p><strong>' + (j.message || j.status) + '</strong></p>';
           if (j.file_name) html += '<p class="muted">' + escapeHtml(j.file_name) + '</p>';
           html += '<div class="bar"><div class="bar-fill" style="width:' + pct + '%"></div></div>';
@@ -451,11 +500,19 @@ def _html() -> str:
           navigator.clipboard.writeText(code.textContent).then(function() { target.textContent = 'Copied!'; });
         }
       }
+      if (target.dataset.action === 'copy-temp-url' && target.dataset.tempUrl) {
+        navigator.clipboard.writeText(target.dataset.tempUrl).then(function() { target.textContent = 'Copied!'; });
+      }
       if (target.dataset.action === 'destroy' && target.dataset.jobId) {
-        fetch('/api/destroy/' + encodeURIComponent(target.dataset.jobId), { method: 'POST' }).then(function(r) { return r.json(); }).then(function(data) {
+        fetch('/api/destroy/' + encodeURIComponent(target.dataset.jobId), { method: 'POST' }).then(async function(r) {
+          var data = await r.json().catch(function() { return { ok: false, message: r.statusText || 'Destroy failed' }; });
+          return { ok: r.ok && !!data.ok, message: data.message || data.detail || 'Destroy failed' };
+        }).then(function(data) {
           if (data.ok) {
             showStatus('<p><strong>File deleted.</strong></p><div class="status-actions"><button type="button" class="btn-secondary btn-sm" data-action="clear">Clear</button></div>', '');
             refreshJobs();
+          } else {
+            showStatus('<p class="failed">' + escapeHtml(data.message) + '</p>', 'failed');
           }
         });
       }

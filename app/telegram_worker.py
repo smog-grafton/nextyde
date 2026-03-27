@@ -262,6 +262,9 @@ class TelegramPipeWorker:
                 elif status == "uploading":
                     job["message"] = "Uploading to CDN…"
                     job["progress_pct"] = 99
+                elif status == "preparing":
+                    job["message"] = data.get("message", "Preparing video…")
+                    job["progress_pct"] = data.get("progress_pct", max(20, progress_extra.get("progress_pct", 20)))
                 elif status == "done":
                     job["message"] = "Done. File deleted."
                     job["progress_pct"] = 100
@@ -363,8 +366,53 @@ class TelegramPipeWorker:
                     raise JobCancelledError("Job cancelled")
                 delivery_file = temp_file
                 if self.settings.video_prep_enabled:
-                    prep_result = prepare_video_for_delivery(self.settings, temp_file)
+                    await self._invoke_progress(
+                        progress_callback,
+                        "preparing",
+                        {"file_name": file_name, "progress_pct": 20, "message": "Analyzing media…"},
+                    )
+                    loop = asyncio.get_running_loop()
+
+                    def prep_progress(stage: str, data: dict[str, Any]) -> None:
+                        pct = int(data.get("progress_pct", 20))
+                        if progress_extra is not None:
+                            progress_extra["progress_pct"] = pct
+                            progress_extra["file_name"] = file_name
+                        msg = "Preparing video…"
+                        if stage == "transcoding_progress":
+                            msg = f"Transcoding for web delivery… ({pct}%)"
+                        elif stage == "prep_skipped":
+                            msg = "Source already delivery-ready. Skipping transcode."
+                        elif stage == "prep_done":
+                            msg = "Video preparation complete."
+                        if progress_callback:
+                            loop.create_task(
+                                self._invoke_progress(
+                                    progress_callback,
+                                    "preparing",
+                                    {"file_name": file_name, "progress_pct": pct, "message": msg},
+                                )
+                            )
+
+                    prep_result = prepare_video_for_delivery(
+                        self.settings,
+                        temp_file,
+                        progress_callback=prep_progress,
+                    )
                     delivery_file = prep_result.delivery_path
+                    await self._invoke_progress(
+                        progress_callback,
+                        "preparing",
+                        {
+                            "file_name": delivery_file.name,
+                            "progress_pct": 97 if prep_result.changed else 100,
+                            "message": (
+                                "Transcode complete, finalizing output…"
+                                if prep_result.changed
+                                else "Source already delivery-ready. Skipping transcode."
+                            ),
+                        },
+                    )
                     metadata.update(
                         {
                             "video_prep_applied": prep_result.changed,

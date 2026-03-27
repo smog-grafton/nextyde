@@ -4,12 +4,14 @@ import logging
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 from app.config import Settings
 from app.media_probe import MediaProbeResult, probe_media
 from app.media_tools import require_media_tools
 
 LOGGER = logging.getLogger("telebot")
+PrepProgressCallback = Callable[[str, dict[str, float | int | str]], None]
 
 
 @dataclass(slots=True)
@@ -69,6 +71,8 @@ def _run_transcode(
     output_path: Path,
     settings: Settings,
     decision: VideoPrepDecision,
+    source_duration_seconds: float | None,
+    progress_callback: PrepProgressCallback | None = None,
 ) -> None:
     vf = "scale='if(gt(ih,{h}),-2,iw)':'if(gt(ih,{h}),{h},ih)':flags=lanczos".format(
         h=settings.video_prep_max_height
@@ -77,8 +81,11 @@ def _run_transcode(
         ffmpeg_binary,
         "-y",
         "-hide_banner",
+        "-nostats",
         "-loglevel",
-        "error",
+        "warning",
+        "-progress",
+        "pipe:1",
         "-i",
         str(input_path),
         "-map",
@@ -111,26 +118,61 @@ def _run_transcode(
         decision.target_height,
     )
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            check=False,
-            timeout=settings.video_prep_timeout_seconds,
         )
     except OSError as exc:
         raise RuntimeError(f"ffmpeg execution failed: {exc}") from exc
+    remaining_output = ""
+    try:
+        if progress_callback:
+            progress_callback("transcoding_started", {"progress_pct": 31})
+        while True:
+            if proc.stdout is None:
+                break
+            line = proc.stdout.readline()
+            if not line:
+                break
+            row = line.strip()
+            if not row or "=" not in row:
+                continue
+            key, value = row.split("=", 1)
+            if key != "out_time_ms":
+                continue
+            if not source_duration_seconds or source_duration_seconds <= 0:
+                continue
+            try:
+                out_time_ms = int(value)
+            except ValueError:
+                continue
+            out_seconds = out_time_ms / 1_000_000.0
+            raw_pct = int((out_seconds / source_duration_seconds) * 100.0)
+            pct = max(31, min(96, raw_pct))
+            if progress_callback:
+                progress_callback("transcoding_progress", {"progress_pct": pct})
+        remaining_output, _ = proc.communicate(timeout=settings.video_prep_timeout_seconds)
     except subprocess.TimeoutExpired as exc:
+        proc.kill()
+        proc.communicate()
         raise RuntimeError("ffmpeg timed out during transcode") from exc
 
     if proc.returncode != 0:
-        stderr = (proc.stderr or "").strip()
-        raise RuntimeError(f"ffmpeg failed with exit {proc.returncode}: {stderr}")
+        stderr_text = (remaining_output or "").strip()
+        raise RuntimeError(f"ffmpeg failed with exit {proc.returncode}: {stderr_text}")
     if not output_path.is_file() or output_path.stat().st_size <= 0:
         raise RuntimeError("ffmpeg finished but no valid output file was produced")
 
 
-def prepare_video_for_delivery(settings: Settings, input_path: Path) -> VideoPrepResult:
+def prepare_video_for_delivery(
+    settings: Settings,
+    input_path: Path,
+    progress_callback: PrepProgressCallback | None = None,
+) -> VideoPrepResult:
+    if progress_callback:
+        progress_callback("probing_started", {"progress_pct": 20})
     tools = require_media_tools()
     source_probe = probe_media(tools.ffprobe.path or "ffprobe", input_path)
     decision = _decide(settings, source_probe)
@@ -148,6 +190,8 @@ def prepare_video_for_delivery(settings: Settings, input_path: Path) -> VideoPre
         decision.reason,
     )
     if not decision.should_transcode:
+        if progress_callback:
+            progress_callback("prep_skipped", {"progress_pct": 100, "reason": decision.reason})
         return VideoPrepResult(
             delivery_path=input_path,
             source_path=input_path,
@@ -160,7 +204,17 @@ def prepare_video_for_delivery(settings: Settings, input_path: Path) -> VideoPre
         )
 
     output_path = _build_output_path(input_path)
-    _run_transcode(tools.ffmpeg.path or "ffmpeg", input_path, output_path, settings, decision)
+    _run_transcode(
+        tools.ffmpeg.path or "ffmpeg",
+        input_path,
+        output_path,
+        settings,
+        decision,
+        source_probe.duration_seconds,
+        progress_callback=progress_callback,
+    )
+    if progress_callback:
+        progress_callback("probe_output", {"progress_pct": 97})
     output_probe = probe_media(tools.ffprobe.path or "ffprobe", output_path)
     source_size = source_probe.size_bytes
     output_size = output_probe.size_bytes
@@ -172,6 +226,8 @@ def prepare_video_for_delivery(settings: Settings, input_path: Path) -> VideoPre
         output_size,
         pct,
     )
+    if progress_callback:
+        progress_callback("prep_done", {"progress_pct": 100})
     return VideoPrepResult(
         delivery_path=output_path,
         source_path=input_path,
