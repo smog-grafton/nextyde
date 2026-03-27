@@ -380,9 +380,12 @@ class TelegramPipeWorker:
 
                     def prep_progress(stage: str, data: dict[str, Any]) -> None:
                         pct = int(data.get("progress_pct", 20))
-                        if progress_extra is not None:
-                            progress_extra["progress_pct"] = pct
-                            progress_extra["file_name"] = file_name
+                        def _update_progress() -> None:
+                            if progress_extra is not None:
+                                progress_extra["progress_pct"] = pct
+                                progress_extra["file_name"] = file_name
+
+                        loop.call_soon_threadsafe(_update_progress)
                         msg = "Preparing video…"
                         if stage == "transcoding_progress":
                             msg = f"Transcoding for web delivery… ({pct}%)"
@@ -391,18 +394,21 @@ class TelegramPipeWorker:
                         elif stage == "prep_done":
                             msg = "Video preparation complete."
                         if progress_callback:
-                            loop.create_task(
-                                self._invoke_progress(
-                                    progress_callback,
-                                    "preparing",
-                                    {"file_name": file_name, "progress_pct": pct, "message": msg},
+                            loop.call_soon_threadsafe(
+                                lambda: loop.create_task(
+                                    self._invoke_progress(
+                                        progress_callback,
+                                        "preparing",
+                                        {"file_name": file_name, "progress_pct": pct, "message": msg},
+                                    )
                                 )
                             )
 
-                    prep_result = prepare_video_for_delivery(
+                    prep_result = await asyncio.to_thread(
+                        prepare_video_for_delivery,
                         self.settings,
                         temp_file,
-                        progress_callback=prep_progress,
+                        prep_progress,
                     )
                     delivery_file = prep_result.delivery_path
                     await self._invoke_progress(
