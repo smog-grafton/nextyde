@@ -342,11 +342,16 @@ class TelegramPipeWorker:
 
             try:
                 await self._invoke_progress(progress_callback, "downloading", {"file_name": file_name, "progress_pct": 0})
+                progress_state = {"last_logged_pct": -1}
 
                 def download_progress(current: int, total: int) -> None:
                     if progress_extra is not None and progress_extra.get("cancelled"):
                         raise JobCancelledError("Job cancelled")
-                    self._progress(file_name, current, total)
+                    if total:
+                        pct = int(current * 100 / total)
+                        if pct != progress_state["last_logged_pct"] and pct in {1, 5, 10, 25, 50, 75, 100}:
+                            progress_state["last_logged_pct"] = pct
+                            LOGGER.info("%s download progress: %s%%", file_name, pct)
                     if progress_extra is not None and total:
                         progress_extra["progress_pct"] = min(99, int(current * 100 / total))
                         progress_extra["file_name"] = file_name
@@ -530,10 +535,3 @@ class TelegramPipeWorker:
         except Exception:  # noqa: BLE001
             pass
 
-    @staticmethod
-    def _progress(file_name: str, current: int, total: int) -> None:
-        if not total:
-            return
-        pct = int(current * 100 / total)
-        if pct in {1, 5, 10, 25, 50, 75, 100}:
-            LOGGER.info("%s download progress: %s%%", file_name, pct)

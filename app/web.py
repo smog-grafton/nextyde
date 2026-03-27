@@ -374,6 +374,7 @@ def _html() -> str:
     const jobsListEl = document.getElementById('jobsList');
     let currentJobId = null;
     let pollInterval = null;
+    let pollTransientFailures = 0;
     try {
       var saved = localStorage.getItem('telebot_channel');
       if (saved) channelInput.value = saved;
@@ -381,14 +382,30 @@ def _html() -> str:
     channelInput.addEventListener('change', function() { try { localStorage.setItem('telebot_channel', channelInput.value); } catch (_) {} });
     channelInput.addEventListener('blur', function() { try { localStorage.setItem('telebot_channel', channelInput.value); } catch (_) {} });
 
+    async function apiJson(url, options) {
+      const r = await fetch(url, options || {});
+      const text = await r.text();
+      let data = null;
+      try {
+        data = text ? JSON.parse(text) : {};
+      } catch (_) {
+        const snippet = (text || '').slice(0, 120);
+        throw new Error((r.ok ? 'Invalid JSON response' : 'HTTP ' + r.status) + ': ' + (snippet || r.statusText || 'empty response'));
+      }
+      if (!r.ok) {
+        const detail = data && (data.detail || data.message || data.error);
+        throw new Error(detail || ('HTTP ' + r.status));
+      }
+      return data;
+    }
+
     async function refreshHealth() {
       try {
-        const r = await fetch('/api/health');
-        const h = await r.json();
+        const h = await apiJson('/api/health');
         serverStatusEl.textContent = h.telegram === 'connected' ? 'Telegram: connected' : 'Telegram: not logged in (run python main.py once to log in)';
         serverStatusEl.className = h.telegram === 'connected' ? 'connected' : 'disconnected';
       } catch (_) {
-        serverStatusEl.textContent = 'Server: unreachable';
+        serverStatusEl.textContent = 'Server: unreachable (proxy/container issue, retrying...)';
         serverStatusEl.className = 'disconnected';
       }
     }
@@ -397,8 +414,7 @@ def _html() -> str:
 
     async function refreshJobs() {
       try {
-        const r = await fetch('/api/jobs?limit=10');
-        const list = await r.json();
+        const list = await apiJson('/api/jobs?limit=10');
         jobsListEl.innerHTML = list.length === 0 ? '<li class="muted">No jobs yet</li>' : list.map(function(j) {
           var label = j.file_name || j.message || j.job_id.slice(0, 8);
           var badgeClass = j.status === 'done' ? 'done' : j.status === 'failed' ? 'failed' : j.status === 'cancelled' ? 'cancelled' : j.status === 'downloaded' ? 'downloaded' : j.status === 'destroyed' ? 'destroyed' : 'running';
@@ -433,10 +449,11 @@ def _html() -> str:
 
     function poll(jobId) {
       currentJobId = jobId;
+      pollTransientFailures = 0;
       pollInterval = setInterval(async () => {
         try {
-          const r = await fetch('/api/status?job_id=' + encodeURIComponent(jobId));
-          const j = await r.json();
+          const j = await apiJson('/api/status?job_id=' + encodeURIComponent(jobId));
+          pollTransientFailures = 0;
           const pct = j.progress_pct ?? 0;
           const canCancel = ['queued', 'starting', 'downloading', 'preparing', 'uploading'].indexOf(j.status) >= 0;
           let html = '<p><strong>' + (j.message || j.status) + '</strong></p>';
@@ -476,8 +493,11 @@ def _html() -> str:
             showStatus(statusEl.innerHTML, 'cancelled');
           }
         } catch (e) {
-          stopPolling();
-          showStatus('<p class="failed">Status check failed: ' + escapeHtml(e.message) + '</p>', 'failed');
+          pollTransientFailures += 1;
+          var transient = '<p><strong>Connection issue while checking status.</strong></p>'
+            + '<p class="muted">Retrying automatically… (' + pollTransientFailures + ')</p>'
+            + '<p class="muted">' + escapeHtml(e.message || 'Unknown error') + '</p>';
+          showStatus(transient, '');
         }
       }, 1500);
     }
@@ -492,7 +512,7 @@ def _html() -> str:
     statusEl.addEventListener('click', function(e) {
       var target = e.target;
       if (target.dataset.action === 'cancel' && target.dataset.jobId) {
-        fetch('/api/cancel?job_id=' + encodeURIComponent(target.dataset.jobId), { method: 'POST' }).then(function() {});
+        apiJson('/api/cancel?job_id=' + encodeURIComponent(target.dataset.jobId), { method: 'POST' }).catch(function() {});
       }
       if (target.dataset.action === 'copy-temp') {
         var code = document.getElementById('tempUrlRef');
@@ -504,16 +524,15 @@ def _html() -> str:
         navigator.clipboard.writeText(target.dataset.tempUrl).then(function() { target.textContent = 'Copied!'; });
       }
       if (target.dataset.action === 'destroy' && target.dataset.jobId) {
-        fetch('/api/destroy/' + encodeURIComponent(target.dataset.jobId), { method: 'POST' }).then(async function(r) {
-          var data = await r.json().catch(function() { return { ok: false, message: r.statusText || 'Destroy failed' }; });
-          return { ok: r.ok && !!data.ok, message: data.message || data.detail || 'Destroy failed' };
-        }).then(function(data) {
+        apiJson('/api/destroy/' + encodeURIComponent(target.dataset.jobId), { method: 'POST' }).then(function(data) {
           if (data.ok) {
             showStatus('<p><strong>File deleted.</strong></p><div class="status-actions"><button type="button" class="btn-secondary btn-sm" data-action="clear">Clear</button></div>', '');
             refreshJobs();
           } else {
-            showStatus('<p class="failed">' + escapeHtml(data.message) + '</p>', 'failed');
+            showStatus('<p class="failed">' + escapeHtml(data.message || 'Destroy failed') + '</p>', 'failed');
           }
+        }).catch(function(err) {
+          showStatus('<p class="failed">' + escapeHtml(err.message || 'Destroy failed') + '</p>', 'failed');
         });
       }
       if (target.dataset.action === 'clear') {
@@ -530,16 +549,11 @@ def _html() -> str:
       showStatus('<p>Starting…</p>', '');
       try {
         const downloadOnly = document.getElementById('downloadOnly').checked;
-        const r = await fetch('/api/process', {
+        const data = await apiJson('/api/process', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ link: link, download_only: downloadOnly })
         });
-        if (!r.ok) {
-          const err = await r.json().catch(() => ({ detail: r.statusText }));
-          throw new Error(err.detail || err.message || 'Request failed');
-        }
-        const data = await r.json();
         poll(data.job_id);
       } catch (err) {
         showStatus('<p class="failed">' + escapeHtml(err.message) + '</p>', 'failed');
