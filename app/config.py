@@ -39,6 +39,8 @@ class Settings:
     db_path: Path
     log_level: str
     max_concurrent_downloads: int
+    max_concurrent_transcodes: int
+    web_max_active_jobs: int
     scan_last_messages: int
     download_chunk_size: int
     delete_after_upload: bool
@@ -61,8 +63,10 @@ class Settings:
     video_prep_crf: int
     video_prep_preset: str
     video_prep_min_size_mb_for_transcode: int
+    video_prep_target_max_mb: int
     video_prep_keep_original_on_success: bool
     video_prep_timeout_seconds: int
+    temp_file_ttl_hours: int
 
     @classmethod
     def load(cls) -> "Settings":
@@ -100,6 +104,8 @@ class Settings:
             db_path=db_path,
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             max_concurrent_downloads=max(1, int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))),
+            max_concurrent_transcodes=max(1, int(os.getenv("MAX_CONCURRENT_TRANSCODES", "1"))),
+            web_max_active_jobs=max(1, int(os.getenv("WEB_MAX_ACTIVE_JOBS", "3"))),
             scan_last_messages=max(0, int(os.getenv("SCAN_LAST_MESSAGES", "15"))),
             download_chunk_size=max(65536, int(os.getenv("DOWNLOAD_CHUNK_SIZE", str(1024 * 1024)))),
             delete_after_upload=_bool("DELETE_AFTER_UPLOAD", True),
@@ -120,8 +126,10 @@ class Settings:
             video_prep_enabled=_bool("VIDEO_PREP_ENABLED", True),
             video_prep_max_height=max(240, int(os.getenv("VIDEO_PREP_MAX_HEIGHT", "720"))),
             video_prep_crf=min(35, max(16, int(os.getenv("VIDEO_PREP_CRF", "22")))),
-            video_prep_preset=(os.getenv("VIDEO_PREP_PRESET", "medium").strip() or "medium"),
+            video_prep_preset=(os.getenv("VIDEO_PREP_PRESET", "veryfast").strip() or "veryfast"),
             video_prep_min_size_mb_for_transcode=max(1, int(os.getenv("VIDEO_PREP_MIN_SIZE_MB_FOR_TRANSCODE", "50"))),
+            video_prep_target_max_mb=max(1, int(os.getenv("VIDEO_PREP_TARGET_MAX_MB", "1024"))),
             video_prep_keep_original_on_success=_bool("VIDEO_PREP_KEEP_ORIGINAL_ON_SUCCESS", False),
             video_prep_timeout_seconds=max(60, int(os.getenv("VIDEO_PREP_TIMEOUT_SECONDS", "7200"))),
+            temp_file_ttl_hours=max(1, int(os.getenv("TEMP_FILE_TTL_HOURS", "24"))),
         )

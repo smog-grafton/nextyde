@@ -71,6 +71,8 @@ TG_JOIN_TARGETS=https://t.me/+abcdefg12345
 TEMP_DIR=/tmp/telebot
 DB_PATH=./telebot_state.db
 MAX_CONCURRENT_DOWNLOADS=1
+MAX_CONCURRENT_TRANSCODES=1
+WEB_MAX_ACTIVE_JOBS=3
 SCAN_LAST_MESSAGES=15
 CDN_UPLOAD_URL=https://cdn.naraboxtv.com/api/v1/media/telegram-intake
 CDN_API_TOKEN=replace_me
@@ -80,10 +82,12 @@ DEFAULT_CATEGORY=movies
 VIDEO_PREP_ENABLED=true
 VIDEO_PREP_MAX_HEIGHT=720
 VIDEO_PREP_CRF=22
-VIDEO_PREP_PRESET=medium
+VIDEO_PREP_PRESET=veryfast
 VIDEO_PREP_MIN_SIZE_MB_FOR_TRANSCODE=50
+VIDEO_PREP_TARGET_MAX_MB=1024
 VIDEO_PREP_KEEP_ORIGINAL_ON_SUCCESS=false
 VIDEO_PREP_TIMEOUT_SECONDS=7200
+TEMP_FILE_TTL_HOURS=24
 FFMPEG_BINARY=
 FFPROBE_BINARY=
 ```
@@ -95,6 +99,7 @@ After Telegram download, the worker:
 - Detects `ffmpeg`/`ffprobe` at runtime (env override first, then `PATH`, with `-version` validation)
 - Probes source media and decides whether to keep source or transcode
 - Transcodes to MP4 with `libx264` + `aac` + `+faststart` when needed
+- Enforces a hard size cap for oversized videos so exposed/uploaded files stay at or below `VIDEO_PREP_TARGET_MAX_MB`
 - Keeps only primary video and first audio stream (`-map 0:v:0 -map 0:a:0?`)
 - Downscales oversized sources to a max height (default `720`) without upscaling
 
@@ -191,7 +196,7 @@ If the app logs show `Uvicorn running on http://0.0.0.0:8765` and deployment suc
 
 ## Web UI
 
-A simple local website to paste a t.me link and run download → CDN → delete without the CLI.
+A local dashboard to paste 1 to 3 Telegram message links at once and run download -> prepare -> CDN or expose a temporary fetch URL.
 
 1. Log in once (so the session exists): run `python main.py`, enter the Telegram code, then stop it (Ctrl+C).
 2. Start the web app:
@@ -201,11 +206,9 @@ source .venv/bin/activate
 python -m app.web
 ```
 
-3. Open **http://127.0.0.1:8765** in your browser. Paste the message link (e.g. `https://t.me/jozzmovies/45`), click **Download & ingest**. Progress is shown; when done, the file is removed locally.
+3. Open **http://127.0.0.1:8765** in your browser. Paste up to 3 message links (one per line), then queue the jobs. The dashboard shows active jobs and recent jobs separately, so refresh-safe actions like **Copy URL** and **Destroy** still work after the page reloads.
 
-**Download only:** Check **Download only (get link → paste in CDN → Destroy)** to skip CDN upload. The telebot downloads the file and shows a temporary URL. Copy that URL, paste it into your CDN’s “import from URL” (source URL), and after the CDN has fetched the file, click **Destroy** to delete the temp file. Set `TEMP_PUBLIC_URL` to your telebot’s public URL (e.g. `https://teletyde.example.com`) so the link is reachable by the CDN. This avoids large uploads from telebot to CDN and works around connection limits.
-
-The optional **Channel** field is stored in your browser only (e.g. `@jozzmovies`); the **Message link** is what gets processed.
+**Download only:** Check **Download only (get link -> paste in CDN -> Destroy)** to skip CDN upload. The telebot downloads the file, finishes any required compression first, then shows a temporary URL that ends with the real final filename such as `.mp4` or `.mkv`. Copy that URL, paste it into your CDN’s “import from URL” (source URL), and after the CDN has fetched it, click **Destroy** to delete the temp file. Set `TEMP_PUBLIC_URL` to your telebot’s public URL (e.g. `https://teletyde.example.com`) so the link is reachable by the CDN. Forgotten download-only files are also cleaned up automatically after `TEMP_FILE_TTL_HOURS`.
 
 ### Does the Web UI work with any channel?
 
@@ -232,4 +235,3 @@ You can also paste a t.me message link in any watched channel; the worker will f
 
 - **CDN:** Use `POST /api/v1/media/telegram-intake` (Bearer token). The telebot sends the multipart upload there.
 - **Portal:** Set `CDN_NOTIFY_URL` to your portal’s `POST /api/telegram/ingest-notify` and `CDN_NOTIFY_TOKEN` to `TELEGRAM_INGEST_NOTIFY_TOKEN` so the portal records each ingest for the admin.
-

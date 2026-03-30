@@ -1,5 +1,5 @@
 """
-Simple web UI: paste a t.me link, run download → CDN → notify → delete.
+Simple web UI: paste one or more t.me links, then run download -> prepare -> CDN or expose temp URL.
 Requires a valid Telethon session (run `python main.py` once to log in).
 """
 from __future__ import annotations
@@ -13,58 +13,175 @@ from pathlib import Path
 from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 from app.config import Settings
+from app.link_parser import parse_telegram_link
 from app.media_tools import detect_media_tools
-from app.telegram_worker import TelegramPipeWorker, JobCancelledError, AlreadyProcessedError
+from app.telegram_worker import AlreadyProcessedError, JobCancelledError, TelegramPipeWorker
 
 LOG = logging.getLogger("telebot.web")
 jobs: dict[str, dict] = {}
 worker: TelegramPipeWorker | None = None
 authorized = False
 
+TERMINAL_STATUSES = {"done", "failed", "cancelled", "destroyed", "expired"}
+CANCELLABLE_STATUSES = {"queued", "downloading", "waiting_to_prepare", "preparing", "uploading"}
+
+
+def _touch_job(job: dict) -> None:
+    job["updated_ts"] = time.time()
+
+
+def _is_terminal_status(status: str | None) -> bool:
+    return (status or "") in TERMINAL_STATUSES
+
+
+def _active_job_count() -> int:
+    return sum(1 for job in jobs.values() if not _is_terminal_status(job.get("status")))
+
+
+def _build_temp_url(current_worker: TelegramPipeWorker | None, job: dict) -> str | None:
+    if not current_worker:
+        return None
+    temp_path = job.get("temp_path")
+    if not temp_path:
+        return None
+    base = (current_worker.settings.temp_public_url or "").strip()
+    if not base:
+        return None
+    file_name = job.get("file_name") or Path(temp_path).name
+    return f"{base.rstrip('/')}/api/temp/{quote(str(job.get('job_id', '')), safe='')}/{quote(file_name, safe='')}"
+
 
 def _job_with_temp_url(job: dict, current_worker: TelegramPipeWorker | None) -> dict:
     out = dict(job)
-    if not current_worker:
-        return out
-    temp_path = out.get("temp_path")
-    if not temp_path:
-        return out
-    base = (current_worker.settings.temp_public_url or "").strip()
-    if base:
-        out["temp_url"] = f"{base.rstrip('/')}/api/temp/{quote(str(out.get('job_id', '')))}" + "/file"
+    out["temp_url"] = _build_temp_url(current_worker, out)
     return out
+
+
+def _pick_recovered_file(files: list[Path]) -> Path:
+    delivery_files = [path for path in files if path.name.endswith(".delivery.mp4")]
+    if delivery_files:
+        return max(delivery_files, key=lambda path: path.stat().st_mtime)
+    return max(files, key=lambda path: path.stat().st_mtime)
 
 
 def _recover_download_only_jobs(current_worker: TelegramPipeWorker) -> int:
     recovered = 0
+    if not current_worker.settings.temp_dir.exists():
+        return recovered
+
     for child in current_worker.settings.temp_dir.iterdir():
         if not child.is_dir():
             continue
         job_id = child.name
         if job_id in jobs:
             continue
-        files = [p for p in child.iterdir() if p.is_file()]
+        files = [path for path in child.rglob("*") if path.is_file()]
         if not files:
             continue
-        latest = max(files, key=lambda p: p.stat().st_mtime)
+        latest = _pick_recovered_file(files)
         jobs[job_id] = {
             "job_id": job_id,
             "status": "downloaded",
             "progress_pct": 100,
             "message": "Recovered after restart. Ready for CDN fetch or destroy.",
             "file_name": latest.name,
+            "link": "",
+            "link_key": "",
             "result": None,
             "error": None,
             "temp_path": str(latest),
             "download_only": True,
             "_ts": latest.stat().st_mtime,
+            "updated_ts": time.time(),
         }
         recovered += 1
     return recovered
+
+
+def _split_link_inputs(*values: str | None) -> list[str]:
+    links: list[str] = []
+    for value in values:
+        if not value:
+            continue
+        for part in value.splitlines():
+            stripped = part.strip()
+            if stripped:
+                links.append(stripped)
+    return links
+
+
+def _normalize_links(link: str | None, links: list[str] | None) -> list[dict[str, str]]:
+    raw_links = _split_link_inputs(link, *(links or []))
+    if not raw_links:
+        raise HTTPException(422, detail="Paste at least one valid Telegram message link.")
+
+    normalized: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw_link in raw_links:
+        parsed = parse_telegram_link(raw_link)
+        if not parsed:
+            raise HTTPException(422, detail=f"Invalid t.me URL: {raw_link}")
+        channel_ref, message_id = parsed
+        link_key = f"{channel_ref.lower()}:{message_id}"
+        if link_key in seen:
+            continue
+        seen.add(link_key)
+        normalized.append({"link": raw_link, "link_key": link_key})
+
+    if len(normalized) > 3:
+        raise HTTPException(422, detail="Paste at most 3 Telegram message links at a time.")
+    return normalized
+
+
+def _find_active_job_by_key(link_key: str) -> dict | None:
+    for job in jobs.values():
+        if job.get("link_key") == link_key and not _is_terminal_status(job.get("status")):
+            return job
+    return None
+
+
+def _build_job(link: str, link_key: str, download_only: bool) -> dict:
+    now = time.time()
+    return {
+        "job_id": str(uuid.uuid4()),
+        "status": "queued",
+        "progress_pct": 0,
+        "message": "Queued…",
+        "file_name": "",
+        "link": link,
+        "link_key": link_key,
+        "result": None,
+        "error": None,
+        "temp_path": None,
+        "download_only": download_only,
+        "_ts": now,
+        "updated_ts": now,
+    }
+
+
+def _job_summary(job: dict) -> dict:
+    return {
+        "job_id": job["job_id"],
+        "status": job.get("status"),
+        "link": job.get("link", ""),
+    }
+
+
+def _job_message(error: Exception) -> str:
+    text = str(error).lower()
+    if "authkeyduplicated" in text or "authorization key" in text:
+        return "Telegram session in use elsewhere or invalid. Use this session only on this server and restart the app."
+    if "disconnected" in text or "cannot send requests while disconnected" in text:
+        return "Telegram disconnected. Reload the page and try again; if it persists, restart the app."
+    if "not logged in" in text:
+        return "Telegram not logged in. Restart the app after logging in with 'python main.py' once."
+    if "readerror" in text or "read error" in text:
+        return "Upload to CDN failed (connection closed). Try again."
+    return str(error)
 
 
 @asynccontextmanager
@@ -74,6 +191,7 @@ async def lifespan(app: FastAPI):
         settings = Settings.load()
         worker = TelegramPipeWorker(settings)
         await worker.store.init()
+        worker.bind_job_registry(jobs)
         worker.settings.temp_dir.mkdir(parents=True, exist_ok=True)
         await worker.client.connect()
         authorized = await worker.client.is_user_authorized()
@@ -85,25 +203,22 @@ async def lifespan(app: FastAPI):
         recovered = _recover_download_only_jobs(worker)
         if recovered:
             LOG.info("Recovered %s download-only job(s) from temp storage", recovered)
-    except Exception as e:
-        LOG.exception("Startup failed: %s", e)
+        await worker.start_housekeeping(jobs)
+    except Exception as exc:
+        LOG.exception("Startup failed: %s", exc)
         authorized = False
     yield
     if worker:
-        await worker.cdn.close()
-        await worker.client.disconnect()
+        await worker.stop()
 
 
 app = FastAPI(title="Narabox Telebot", lifespan=lifespan)
 
 
 class ProcessRequest(BaseModel):
-    link: str
+    link: str | None = None
+    links: list[str] | None = None
     download_only: bool = False
-
-    @property
-    def link_str(self) -> str:
-        return self.link.strip()
 
 
 @app.post("/api/process")
@@ -113,52 +228,56 @@ async def api_process(req: ProcessRequest):
             503,
             detail="Telegram not logged in. Run 'python main.py' once, enter the code, then restart the web app.",
         )
-    from app.link_parser import parse_telegram_link
-    if not parse_telegram_link(req.link_str):
-        raise HTTPException(422, detail="Invalid t.me URL. Use e.g. https://t.me/jozzmovies/45")
-    job_id = str(uuid.uuid4())
-    download_only = req.download_only or (worker.settings.download_only if worker else False)
-    jobs[job_id] = {
-        "job_id": job_id,
-        "status": "queued",
-        "progress_pct": 0,
-        "message": "Queued…",
-        "file_name": "",
-        "result": None,
-        "error": None,
-        "temp_path": None,
-        "download_only": download_only,
-        "_ts": time.time(),
-    }
 
-    def _job_message(e: Exception) -> str:
-        s = str(e).lower()
-        if "authkeyduplicated" in s or "authorization key" in s:
-            return "Telegram session in use elsewhere or invalid. Use this session only on this server and restart the app."
-        if "disconnected" in s or "cannot send requests while disconnected" in s:
-            return "Telegram disconnected. Reload the page and try again; if it persists, restart the app."
-        if "not logged in" in s:
-            return "Telegram not logged in. Restart the app after logging in with 'python main.py' once."
-        if "readerror" in s or "read error" in s:
-            return "Upload to CDN failed (connection closed). Try again."
-        return str(e)
+    normalized_links = _normalize_links(req.link, req.links)
+    download_only = req.download_only or worker.settings.download_only
 
-    async def run():
+    existing_jobs: list[dict] = []
+    new_jobs: list[dict] = []
+    for entry in normalized_links:
+        existing = _find_active_job_by_key(entry["link_key"])
+        if existing is not None:
+            existing_jobs.append(existing)
+            continue
+        new_jobs.append(_build_job(entry["link"], entry["link_key"], download_only))
+
+    active_limit = worker.settings.web_max_active_jobs
+    if _active_job_count() + len(new_jobs) > active_limit:
+        raise HTTPException(429, detail=f"There are already {active_limit} active jobs. Wait for one to finish or destroy a downloaded file first.")
+
+    async def run_job(job_id: str) -> None:
+        job = jobs[job_id]
         try:
-            await worker.process_link(req.link_str, job=jobs[job_id])
-        except AlreadyProcessedError as e:
-            jobs[job_id]["status"] = "failed"
-            jobs[job_id]["error"] = str(e)
-            jobs[job_id]["message"] = str(e)
-            LOG.info("Job %s skipped (already processed): %s", job_id, e)
-        except Exception as e:
-            jobs[job_id]["status"] = "failed"
-            jobs[job_id]["error"] = str(e)
-            jobs[job_id]["message"] = _job_message(e)
-            LOG.exception("Job %s failed: %s", job_id, e)
+            await worker.process_link(job["link"], job=job)
+        except AlreadyProcessedError as exc:
+            job["status"] = "failed"
+            job["error"] = str(exc)
+            job["message"] = str(exc)
+            _touch_job(job)
+            LOG.info("Job %s skipped (already processed): %s", job_id, exc)
+        except JobCancelledError:
+            job["status"] = "cancelled"
+            job["message"] = "Cancelled."
+            job["error"] = None
+            _touch_job(job)
+            LOG.info("Job %s cancelled", job_id)
+        except Exception as exc:  # noqa: BLE001
+            job["status"] = "failed"
+            job["error"] = str(exc)
+            job["message"] = _job_message(exc)
+            _touch_job(job)
+            LOG.exception("Job %s failed: %s", job_id, exc)
 
-    asyncio.create_task(run())
-    return {"job_id": job_id, "status": "queued"}
+    for job in new_jobs:
+        jobs[job["job_id"]] = job
+        asyncio.create_task(run_job(job["job_id"]))
+
+    response_jobs = [_job_summary(job) for job in existing_jobs + new_jobs]
+    payload: dict[str, object] = {"jobs": response_jobs}
+    if len(response_jobs) == 1:
+        payload["job_id"] = response_jobs[0]["job_id"]
+        payload["status"] = response_jobs[0]["status"]
+    return payload
 
 
 @app.get("/api/status")
@@ -172,63 +291,90 @@ async def api_status(job_id: str):
 async def api_cancel(job_id: str):
     if job_id not in jobs:
         raise HTTPException(404, detail="Job not found")
-    j = jobs[job_id]
-    if j["status"] in ("done", "failed", "cancelled"):
+    job = jobs[job_id]
+    if job.get("status") not in CANCELLABLE_STATUSES:
         return {"ok": True, "message": "Job already finished"}
-    j["cancelled"] = True
+    job["cancelled"] = True
+    job["message"] = "Cancellation requested…"
+    _touch_job(job)
     return {"ok": True, "message": "Cancel requested"}
 
 
-@app.get("/api/temp/{job_id}/file")
-async def api_temp_file(job_id: str):
-    """Serve the downloaded file so the CDN (or you) can fetch it by URL. Only for jobs in 'downloaded' state."""
+def _resolve_temp_file(job_id: str) -> tuple[dict, Path]:
     if job_id not in jobs:
         raise HTTPException(404, detail="Job not found")
-    j = jobs[job_id]
-    if not j.get("temp_path"):
+    job = jobs[job_id]
+    if not job.get("temp_path"):
         raise HTTPException(404, detail="File not available for this job")
-    if j.get("status") not in {"downloaded", "failed"}:
+    if job.get("status") not in {"downloaded", "failed"}:
         raise HTTPException(404, detail="File not available (wrong status)")
-    path = j.get("temp_path")
-    if not path or not Path(path).is_file():
+    path = Path(job["temp_path"])
+    if not path.is_file():
         raise HTTPException(404, detail="File not found or already destroyed")
-    return FileResponse(path, filename=j.get("file_name") or Path(path).name, media_type="application/octet-stream")
+    return job, path
+
+
+@app.get("/api/temp/{job_id}/{filename}")
+async def api_temp_file(job_id: str, filename: str):
+    job, path = _resolve_temp_file(job_id)
+    expected_name = job.get("file_name") or path.name
+    if filename != expected_name:
+        raise HTTPException(404, detail="File not available for this URL")
+    return FileResponse(path, filename=expected_name, media_type="application/octet-stream")
+
+
+@app.get("/api/temp/{job_id}/file")
+async def api_temp_file_legacy(job_id: str):
+    job, path = _resolve_temp_file(job_id)
+    expected_name = job.get("file_name") or path.name
+    return RedirectResponse(
+        url=f"/api/temp/{quote(job_id, safe='')}/{quote(expected_name, safe='')}",
+        status_code=307,
+    )
 
 
 @app.post("/api/destroy/{job_id}")
 async def api_destroy(job_id: str):
-    """Delete the temp file for this job after you have imported it to the CDN. Call once CDN has fetched the file."""
     if job_id not in jobs:
         raise HTTPException(404, detail="Job not found")
-    j = jobs[job_id]
-    if j.get("status") == "destroyed":
+
+    job = jobs[job_id]
+    if job.get("status") == "destroyed":
         return {"ok": True, "message": "Already destroyed"}
-    if not j.get("temp_path"):
+    if not job.get("temp_path"):
         raise HTTPException(400, detail="No temp file recorded for this job")
-    path = Path(j.get("temp_path") or "")
+
+    path = Path(job["temp_path"])
     if path.is_file():
         try:
             path.unlink()
-        except OSError as e:
-            raise HTTPException(500, detail=f"Could not delete file: {e}") from e
+        except OSError as exc:
+            raise HTTPException(500, detail=f"Could not delete file: {exc}") from exc
+
+    root_temp_dir = worker.settings.temp_dir if worker is not None else path.parent
     parent = path.parent
-    if parent.is_dir() and str(parent) != ".":
+    while parent != root_temp_dir and parent.exists():
         try:
             parent.rmdir()
         except OSError:
-            pass
-    j["status"] = "destroyed"
-    j["message"] = "File deleted."
-    j["temp_path"] = None
-    j["temp_url"] = None
+            break
+        parent = parent.parent
+
+    job["status"] = "destroyed"
+    job["message"] = "File deleted."
+    job["temp_path"] = None
+    _touch_job(job)
     return {"ok": True, "message": "File deleted"}
 
 
 @app.get("/api/jobs")
-async def api_jobs(limit: int = 20):
-    """List recent jobs (newest first)."""
-    order = sorted(jobs.items(), key=lambda x: x[1].get("_ts", 0), reverse=True)
-    return [_job_with_temp_url(v, worker) for _, v in order[:limit]]
+async def api_jobs(limit: int = 30):
+    order = sorted(
+        jobs.items(),
+        key=lambda item: (item[1].get("updated_ts", item[1].get("_ts", 0)), item[1].get("_ts", 0)),
+        reverse=True,
+    )
+    return [_job_with_temp_url(job, worker) for _, job in order[:limit]]
 
 
 @app.get("/api/health")
@@ -237,6 +383,7 @@ async def api_health():
     return {
         "telegram": "connected" if authorized else "not_logged_in",
         "worker": worker is not None,
+        "active_jobs": _active_job_count(),
         "ffmpeg_available": tools.ffmpeg.available,
         "ffprobe_available": tools.ffprobe.available,
         "ffmpeg_path": tools.ffmpeg.path,
@@ -250,7 +397,6 @@ async def api_health():
 
 @app.get("/health")
 async def root_health():
-    """Simple 200 for proxy/load-balancer health checks. Use /api/health for full status."""
     return {"status": "ok"}
 
 
@@ -260,306 +406,570 @@ def _html() -> str:
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Narabox Telebot – Ingest from Telegram</title>
+  <title>Narabox Telebot - Batch Telegram Intake</title>
   <style>
+    :root {
+      --bg: #f6f7f3;
+      --panel: #ffffff;
+      --ink: #15211d;
+      --muted: #5c6d66;
+      --line: #d7dfd9;
+      --accent: #0d7a5f;
+      --accent-strong: #095842;
+      --warning: #f4b400;
+      --danger: #c0392b;
+      --success: #1f7a44;
+      --shadow: 0 18px 44px rgba(21, 33, 29, 0.08);
+      --radius: 18px;
+    }
     * { box-sizing: border-box; }
     body {
-      font-family: system-ui, -apple-system, sans-serif;
-      max-width: 560px;
-      margin: 2rem auto;
-      padding: 0 1rem;
-      color: #1a1a1a;
-      background: #f5f5f5;
+      margin: 0;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(13, 122, 95, 0.12), transparent 28%),
+        linear-gradient(180deg, #fbfcfa 0%, var(--bg) 100%);
+      color: var(--ink);
     }
-    h1 { font-size: 1.5rem; margin-bottom: 0.5rem; }
-    .muted { color: #666; font-size: 0.9rem; margin-bottom: 1.5rem; }
-    label { display: block; font-weight: 600; margin-bottom: 0.35rem; }
-    input[type="text"], input[type="url"] {
+    .shell {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 2rem 1rem 3rem;
+    }
+    .hero {
+      display: grid;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+    .hero-card {
+      background: var(--panel);
+      border: 1px solid rgba(13, 122, 95, 0.18);
+      border-radius: 26px;
+      box-shadow: var(--shadow);
+      padding: 1.5rem;
+    }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      background: rgba(13, 122, 95, 0.08);
+      color: var(--accent-strong);
+      border-radius: 999px;
+      padding: 0.35rem 0.75rem;
+      font-size: 0.82rem;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+    h1 {
+      margin: 0.7rem 0 0.5rem;
+      font-size: clamp(2rem, 4vw, 3.4rem);
+      line-height: 0.95;
+      letter-spacing: -0.03em;
+    }
+    .hero-copy {
+      max-width: 760px;
+      color: var(--muted);
+      font-size: 1.02rem;
+      line-height: 1.6;
+    }
+    .layout {
+      display: grid;
+      gap: 1.25rem;
+      grid-template-columns: minmax(0, 360px) minmax(0, 1fr);
+      align-items: start;
+    }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      padding: 1.25rem;
+    }
+    .panel h2 {
+      margin: 0 0 0.6rem;
+      font-size: 1.15rem;
+    }
+    .panel p {
+      margin: 0 0 1rem;
+      color: var(--muted);
+      line-height: 1.55;
+      font-size: 0.95rem;
+    }
+    textarea, input[type="text"] {
       width: 100%;
-      padding: 0.6rem 0.75rem;
-      border: 1px solid #ccc;
-      border-radius: 6px;
-      font-size: 1rem;
-      margin-bottom: 1rem;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 0.9rem 1rem;
+      font: inherit;
+      background: #fbfcfa;
+      color: var(--ink);
+      transition: border-color 0.2s ease, box-shadow 0.2s ease;
     }
-    input:focus { outline: none; border-color: #0d6efd; }
+    textarea {
+      min-height: 170px;
+      resize: vertical;
+    }
+    textarea:focus, input[type="text"]:focus {
+      outline: none;
+      border-color: rgba(13, 122, 95, 0.75);
+      box-shadow: 0 0 0 4px rgba(13, 122, 95, 0.14);
+    }
+    .hint {
+      font-size: 0.88rem;
+      color: var(--muted);
+      margin-top: 0.55rem;
+    }
+    .checkbox-row {
+      display: flex;
+      gap: 0.7rem;
+      align-items: start;
+      margin: 1rem 0 1.1rem;
+      font-size: 0.95rem;
+    }
+    .checkbox-row input {
+      margin-top: 0.18rem;
+    }
     button {
-      background: #0d6efd;
-      color: #fff;
       border: none;
-      padding: 0.65rem 1.25rem;
-      border-radius: 6px;
-      font-size: 1rem;
+      border-radius: 999px;
       cursor: pointer;
+      font: inherit;
+      transition: transform 0.14s ease, opacity 0.14s ease, background 0.14s ease;
+    }
+    button:hover { transform: translateY(-1px); }
+    button:disabled { opacity: 0.65; cursor: not-allowed; transform: none; }
+    .btn-primary {
       width: 100%;
+      padding: 0.9rem 1.1rem;
+      background: linear-gradient(135deg, var(--accent) 0%, var(--accent-strong) 100%);
+      color: white;
+      font-weight: 600;
     }
-    button:hover { background: #0b5ed7; }
-    button:disabled { background: #6c757d; cursor: not-allowed; }
-    #status {
-      margin-top: 1.5rem;
+    .btn-secondary {
+      background: #eaf1ed;
+      color: var(--ink);
+      padding: 0.55rem 0.9rem;
+    }
+    .btn-danger {
+      background: #f9e5e1;
+      color: var(--danger);
+      padding: 0.55rem 0.9rem;
+    }
+    .notice {
+      min-height: 52px;
+      padding: 0.85rem 1rem;
+      border-radius: 14px;
+      background: #edf6f2;
+      color: var(--accent-strong);
+      border: 1px solid rgba(13, 122, 95, 0.18);
+      display: none;
+      margin-top: 1rem;
+      line-height: 1.5;
+    }
+    .notice.error {
+      background: #faece9;
+      color: var(--danger);
+      border-color: rgba(192, 57, 43, 0.18);
+    }
+    .server-status {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.6rem;
+      margin-top: 0.9rem;
+    }
+    .pill {
+      border-radius: 999px;
+      padding: 0.4rem 0.75rem;
+      background: #eff3f1;
+      color: var(--muted);
+      font-size: 0.86rem;
+    }
+    .pill.good {
+      background: #e1f3e6;
+      color: var(--success);
+    }
+    .pill.bad {
+      background: #faece9;
+      color: var(--danger);
+    }
+    .dashboard {
+      display: grid;
+      gap: 1.25rem;
+    }
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 1rem;
+      margin-bottom: 0.85rem;
+    }
+    .section-head h3 {
+      margin: 0;
+      font-size: 1rem;
+    }
+    .section-head span {
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+    .job-grid {
+      display: grid;
+      gap: 0.95rem;
+    }
+    .empty {
+      border: 1px dashed var(--line);
+      border-radius: 16px;
       padding: 1rem;
-      border-radius: 8px;
-      background: #fff;
-      border: 1px solid #dee2e6;
-      min-height: 80px;
+      color: var(--muted);
+      background: rgba(255, 255, 255, 0.65);
     }
-    #status:empty { display: none; }
+    .job-card {
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 1rem;
+      background: #fbfcfa;
+      display: grid;
+      gap: 0.75rem;
+    }
+    .job-card[data-status="downloaded"] {
+      border-color: rgba(13, 122, 95, 0.32);
+      background: #f4fbf8;
+    }
+    .job-card[data-status="failed"] {
+      border-color: rgba(192, 57, 43, 0.22);
+      background: #fff7f6;
+    }
+    .job-card[data-status="expired"],
+    .job-card[data-status="destroyed"] {
+      background: #f4f5f3;
+    }
+    .job-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: start;
+      gap: 1rem;
+    }
+    .job-title {
+      margin: 0;
+      font-size: 1rem;
+      line-height: 1.35;
+    }
+    .job-link {
+      color: var(--muted);
+      font-size: 0.86rem;
+      word-break: break-all;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 999px;
+      padding: 0.35rem 0.7rem;
+      background: #eef4f0;
+      color: var(--accent-strong);
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      white-space: nowrap;
+    }
+    .badge.running { background: #e4f0ff; color: #0c4f99; }
+    .badge.done { background: #e1f3e6; color: var(--success); }
+    .badge.failed { background: #faece9; color: var(--danger); }
+    .badge.cancelled, .badge.destroyed, .badge.expired { background: #ecefe9; color: #5f6b65; }
+    .badge.downloaded { background: #e3f7ef; color: var(--accent-strong); }
+    .job-message {
+      color: var(--ink);
+      font-size: 0.94rem;
+    }
     .bar {
-      height: 8px;
-      background: #e9ecef;
-      border-radius: 4px;
+      height: 9px;
+      border-radius: 999px;
+      background: #e8ece8;
       overflow: hidden;
-      margin-top: 0.5rem;
     }
     .bar-fill {
       height: 100%;
-      background: #0d6efd;
-      transition: width 0.3s ease;
+      background: linear-gradient(90deg, var(--accent) 0%, #1ab588 100%);
+      transition: width 0.28s ease;
     }
-    .done { border-color: #198754; background: #d1e7dd; }
-    .failed { border-color: #dc3545; background: #f8d7da; }
-    .cancelled { border-color: #6c757d; background: #e9ecef; }
-    .channel-hint { font-size: 0.85rem; color: #666; margin-top: 0.25rem; }
-    .status-actions { margin-top: 0.75rem; display: flex; gap: 0.5rem; flex-wrap: wrap; }
-    .btn-secondary { background: #6c757d; }
-    .btn-secondary:hover { background: #5a6268; }
-    .btn-danger { background: #dc3545; }
-    .btn-danger:hover { background: #c82333; }
-    .btn-sm { padding: 0.4rem 0.8rem; font-size: 0.9rem; width: auto; }
-    .checkbox-label { display: flex; align-items: center; gap: 0.5rem; margin-bottom: 1rem; font-weight: normal; }
-    .checkbox-label input { width: auto; margin: 0; }
-    .temp-url-box { margin: 0.5rem 0; padding: 0.5rem; background: #f0f0f0; border-radius: 4px; font-size: 0.85rem; word-break: break-all; }
-    #serverStatus { font-size: 0.85rem; color: #666; margin-bottom: 1rem; }
-    #serverStatus.connected { color: #198754; }
-    #serverStatus.disconnected { color: #dc3545; }
-    .jobs-list { margin-top: 1.5rem; }
-    .jobs-list h3 { font-size: 1rem; margin-bottom: 0.5rem; }
-    .jobs-list ul { list-style: none; padding: 0; margin: 0; }
-    .jobs-list li { padding: 0.4rem 0; border-bottom: 1px solid #eee; font-size: 0.9rem; display: flex; justify-content: space-between; align-items: center; }
-    .jobs-list .badge { font-size: 0.75rem; padding: 0.2rem 0.5rem; border-radius: 4px; }
-    .jobs-list .badge.done { background: #d1e7dd; color: #0f5132; }
-    .jobs-list .badge.failed { background: #f8d7da; color: #842029; }
-    .jobs-list .badge.cancelled { background: #e9ecef; color: #495057; }
-    .jobs-list .badge.running { background: #cce5ff; color: #004085; }
-    .jobs-list .badge.downloaded { background: #cce5ff; color: #004085; }
-    .jobs-list .badge.destroyed { background: #e9ecef; color: #495057; }
+    .meta-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.55rem;
+      color: var(--muted);
+      font-size: 0.82rem;
+    }
+    .temp-url {
+      padding: 0.8rem 0.9rem;
+      border-radius: 14px;
+      background: #eef4f0;
+      color: var(--ink);
+      font-size: 0.85rem;
+      overflow-wrap: anywhere;
+    }
+    .job-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.65rem;
+    }
+    @media (max-width: 880px) {
+      .layout { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
-  <h1>Narabox Telebot</h1>
-  <p id="serverStatus" class="muted">Checking…</p>
-  <p class="muted">Paste a Telegram message link. With <strong>Download only</strong>: get a link to the file, paste it in the CDN import, then click Destroy.</p>
-  <form id="form">
-    <label for="channel">Channel (saved in browser)</label>
-    <input type="text" id="channel" name="channel" placeholder="@jozzmovies">
-    <p class="channel-hint">Optional. Paste a channel to remember it; the link below is what gets processed.</p>
-    <label for="link">Message link</label>
-    <input type="url" id="link" name="link" placeholder="https://t.me/jozzmovies/45" required>
-    <p class="channel-hint">Paste a t.me link like <code>https://t.me/channelname/123</code> (message must contain a video).</p>
-    <label class="checkbox-label"><input type="checkbox" id="downloadOnly" name="download_only"> Download only (get link → paste in CDN → Destroy)</label>
-    <button type="submit" id="btn">Download &amp; ingest</button>
-  </form>
-  <div id="status"></div>
-  <div class="jobs-list">
-    <h3>Recent jobs</h3>
-    <ul id="jobsList"></ul>
+  <div class="shell">
+    <section class="hero">
+      <div class="hero-card">
+        <div class="eyebrow">Telegram intake dashboard</div>
+        <h1>Queue up to 3 movie links and keep every job under control.</h1>
+        <p class="hero-copy">Each job still follows the same safe flow: Telegram download, video preparation, then either CDN upload or a real temporary file URL with the final extension already in place.</p>
+        <div class="server-status" id="serverStatus"></div>
+      </div>
+    </section>
+
+    <div class="layout">
+      <section class="panel">
+        <h2>Start jobs</h2>
+        <p>Paste 1 to 3 Telegram message links, one per line. Duplicate links are reused instead of spawning another heavy download or transcode.</p>
+        <form id="form">
+          <label for="linksInput"><strong>Telegram message links</strong></label>
+          <textarea id="linksInput" name="links" placeholder="https://t.me/channelname/123&#10;https://t.me/channelname/124&#10;https://t.me/c/1234567890/45" required></textarea>
+          <div class="hint">The app trims blank lines and only accepts up to 3 links at a time.</div>
+          <label class="checkbox-row">
+            <input type="checkbox" id="downloadOnly" name="download_only">
+            <span>Download only. The job will prepare the file, expose the final URL, then wait for you to click Destroy after your CDN fetches it.</span>
+          </label>
+          <button class="btn-primary" type="submit" id="submitBtn">Queue jobs</button>
+        </form>
+        <div class="notice" id="notice"></div>
+      </section>
+
+      <section class="dashboard" id="jobsPanel">
+        <div class="panel">
+          <div class="section-head">
+            <h3>Active jobs</h3>
+            <span id="activeCount">0 active</span>
+          </div>
+          <div class="job-grid" id="activeJobs"></div>
+        </div>
+        <div class="panel">
+          <div class="section-head">
+            <h3>Recent jobs</h3>
+            <span>Refresh-safe copy and destroy controls stay here too.</span>
+          </div>
+          <div class="job-grid" id="recentJobs"></div>
+        </div>
+      </section>
+    </div>
   </div>
+
   <script>
+    const TERMINAL_STATUSES = new Set(['done', 'failed', 'cancelled', 'destroyed', 'expired']);
+    const CANCELLABLE_STATUSES = new Set(['queued', 'downloading', 'waiting_to_prepare', 'preparing', 'uploading']);
     const form = document.getElementById('form');
-    const channelInput = document.getElementById('channel');
-    const linkInput = document.getElementById('link');
-    const btn = document.getElementById('btn');
-    const statusEl = document.getElementById('status');
+    const linksInput = document.getElementById('linksInput');
+    const submitBtn = document.getElementById('submitBtn');
+    const noticeEl = document.getElementById('notice');
+    const jobsPanel = document.getElementById('jobsPanel');
+    const activeJobsEl = document.getElementById('activeJobs');
+    const recentJobsEl = document.getElementById('recentJobs');
+    const activeCountEl = document.getElementById('activeCount');
     const serverStatusEl = document.getElementById('serverStatus');
-    const jobsListEl = document.getElementById('jobsList');
-    let currentJobId = null;
-    let pollInterval = null;
-    let pollTransientFailures = 0;
-    try {
-      var saved = localStorage.getItem('telebot_channel');
-      if (saved) channelInput.value = saved;
-    } catch (_) {}
-    channelInput.addEventListener('change', function() { try { localStorage.setItem('telebot_channel', channelInput.value); } catch (_) {} });
-    channelInput.addEventListener('blur', function() { try { localStorage.setItem('telebot_channel', channelInput.value); } catch (_) {} });
 
     async function apiJson(url, options) {
-      const r = await fetch(url, options || {});
-      const text = await r.text();
-      let data = null;
+      const response = await fetch(url, options || {});
+      const text = await response.text();
+      let data = {};
       try {
         data = text ? JSON.parse(text) : {};
       } catch (_) {
         const snippet = (text || '').slice(0, 120);
-        throw new Error((r.ok ? 'Invalid JSON response' : 'HTTP ' + r.status) + ': ' + (snippet || r.statusText || 'empty response'));
+        throw new Error((response.ok ? 'Invalid JSON response' : 'HTTP ' + response.status) + ': ' + (snippet || response.statusText || 'empty response'));
       }
-      if (!r.ok) {
+      if (!response.ok) {
         const detail = data && (data.detail || data.message || data.error);
-        throw new Error(detail || ('HTTP ' + r.status));
+        throw new Error(detail || ('HTTP ' + response.status));
       }
       return data;
     }
 
-    async function refreshHealth() {
-      try {
-        const h = await apiJson('/api/health');
-        serverStatusEl.textContent = h.telegram === 'connected' ? 'Telegram: connected' : 'Telegram: not logged in (run python main.py once to log in)';
-        serverStatusEl.className = h.telegram === 'connected' ? 'connected' : 'disconnected';
-      } catch (_) {
-        serverStatusEl.textContent = 'Server: unreachable (proxy/container issue, retrying...)';
-        serverStatusEl.className = 'disconnected';
+    function showNotice(message, kind) {
+      if (!message) {
+        noticeEl.style.display = 'none';
+        noticeEl.className = 'notice';
+        noticeEl.textContent = '';
+        return;
       }
-    }
-    refreshHealth();
-    setInterval(refreshHealth, 60000);
-
-    async function refreshJobs() {
-      try {
-        const list = await apiJson('/api/jobs?limit=10');
-        jobsListEl.innerHTML = list.length === 0 ? '<li class="muted">No jobs yet</li>' : list.map(function(j) {
-          var label = j.file_name || j.message || j.job_id.slice(0, 8);
-          var badgeClass = j.status === 'done' ? 'done' : j.status === 'failed' ? 'failed' : j.status === 'cancelled' ? 'cancelled' : j.status === 'downloaded' ? 'downloaded' : j.status === 'destroyed' ? 'destroyed' : 'running';
-          var badge = '<span class="badge ' + badgeClass + '">' + j.status + '</span>';
-          var actions = '';
-          if (j.temp_path) {
-            if (j.temp_url) {
-              actions += '<button type="button" class="btn-secondary btn-sm" data-action="copy-temp-url" data-temp-url="' + escapeHtml(j.temp_url) + '">Copy URL</button>';
-            }
-            actions += '<button type="button" class="btn-danger btn-sm" data-action="destroy" data-job-id="' + escapeHtml(j.job_id) + '">Destroy</button>';
-          }
-          return '<li><span title="' + escapeHtml(j.job_id) + '">' + escapeHtml(String(label).slice(0, 50)) + '</span><span>' + badge + actions + '</span></li>';
-        }).join('');
-      } catch (_) {}
-    }
-    setInterval(refreshJobs, 5000);
-    refreshJobs();
-
-    function showStatus(html, className = '') {
-      statusEl.innerHTML = html;
-      statusEl.className = className;
-      statusEl.style.display = 'block';
+      noticeEl.textContent = message;
+      noticeEl.className = kind === 'error' ? 'notice error' : 'notice';
+      noticeEl.style.display = 'block';
     }
 
-    function stopPolling() {
-      if (pollInterval) clearInterval(pollInterval);
-      pollInterval = null;
-      currentJobId = null;
-      btn.disabled = false;
-      refreshJobs();
+    function splitLinks(raw) {
+      return raw.split(/\\n+/).map((item) => item.trim()).filter(Boolean);
     }
 
-    function poll(jobId) {
-      currentJobId = jobId;
-      pollTransientFailures = 0;
-      pollInterval = setInterval(async () => {
-        try {
-          const j = await apiJson('/api/status?job_id=' + encodeURIComponent(jobId));
-          pollTransientFailures = 0;
-          const pct = j.progress_pct ?? 0;
-          const canCancel = ['queued', 'starting', 'downloading', 'preparing', 'uploading'].indexOf(j.status) >= 0;
-          let html = '<p><strong>' + (j.message || j.status) + '</strong></p>';
-          if (j.file_name) html += '<p class="muted">' + escapeHtml(j.file_name) + '</p>';
-          html += '<div class="bar"><div class="bar-fill" style="width:' + pct + '%"></div></div>';
-          if (j.status === 'downloaded') {
-            if (j.temp_url) {
-              html += '<p class="muted">Paste this URL in CDN import (source URL), then click Destroy after the CDN has fetched it.</p>';
-              html += '<div class="temp-url-box"><code id="tempUrlRef">' + escapeHtml(j.temp_url) + '</code></div>';
-              html += '<div class="status-actions"><button type="button" class="btn-secondary btn-sm" data-action="copy-temp" data-job-id="' + escapeHtml(jobId) + '">Copy link</button><button type="button" class="btn-danger btn-sm" data-action="destroy" data-job-id="' + escapeHtml(jobId) + '">Destroy</button><button type="button" class="btn-secondary btn-sm" data-action="clear">Clear</button></div>';
-            } else {
-              html += '<p class="muted">Set TEMP_PUBLIC_URL on the server to get the link. Path: ' + escapeHtml(j.temp_path || '') + '</p>';
-              html += '<div class="status-actions"><button type="button" class="btn-danger btn-sm" data-action="destroy" data-job-id="' + escapeHtml(jobId) + '">Destroy</button><button type="button" class="btn-secondary btn-sm" data-action="clear">Clear</button></div>';
-            }
-          } else {
-            html += '<div class="status-actions">';
-            if (canCancel) html += '<button type="button" class="btn-danger btn-sm" data-action="cancel" data-job-id="' + escapeHtml(jobId) + '">Cancel</button>';
-            html += '<button type="button" class="btn-secondary btn-sm" data-action="clear">Clear</button></div>';
-          }
-          var statusClass = j.status === 'failed' ? 'failed' : j.status === 'done' ? 'done' : j.status === 'cancelled' ? 'cancelled' : j.status === 'downloaded' ? 'done' : '';
-          showStatus(html, statusClass);
-          if (j.status === 'done') {
-            if (j.result && j.result.asset_id) html += '<p class="muted">Asset: ' + escapeHtml(j.result.asset_id) + '</p>';
-            showStatus(statusEl.innerHTML, 'done');
-            stopPolling();
-          }
-          if (j.status === 'downloaded') {
-            stopPolling();
-          }
-          if (j.status === 'failed') {
-            if (j.error) html += '<p class="muted">' + escapeHtml(j.error) + '</p>';
-            showStatus(statusEl.innerHTML, 'failed');
-            stopPolling();
-          }
-          if (j.status === 'cancelled') {
-            stopPolling();
-            showStatus(statusEl.innerHTML, 'cancelled');
-          }
-        } catch (e) {
-          pollTransientFailures += 1;
-          var transient = '<p><strong>Connection issue while checking status.</strong></p>'
-            + '<p class="muted">Retrying automatically… (' + pollTransientFailures + ')</p>'
-            + '<p class="muted">' + escapeHtml(e.message || 'Unknown error') + '</p>';
-          showStatus(transient, '');
-        }
-      }, 1500);
+    function badgeClass(status) {
+      if (status === 'done') return 'badge done';
+      if (status === 'downloaded') return 'badge downloaded';
+      if (status === 'failed') return 'badge failed';
+      if (status === 'cancelled' || status === 'destroyed' || status === 'expired') return 'badge ' + status;
+      return 'badge running';
     }
 
-    function escapeHtml(s) {
-      if (s == null) return '';
+    function escapeHtml(value) {
+      if (value == null) return '';
       const div = document.createElement('div');
-      div.textContent = s;
+      div.textContent = String(value);
       return div.innerHTML;
     }
 
-    statusEl.addEventListener('click', function(e) {
-      var target = e.target;
-      if (target.dataset.action === 'cancel' && target.dataset.jobId) {
-        apiJson('/api/cancel?job_id=' + encodeURIComponent(target.dataset.jobId), { method: 'POST' }).catch(function() {});
+    function renderJob(job) {
+      const label = job.file_name || job.link || job.message || job.job_id.slice(0, 8);
+      const pct = Math.max(0, Math.min(100, Number(job.progress_pct || 0)));
+      let actions = '';
+      if (CANCELLABLE_STATUSES.has(job.status)) {
+        actions += '<button type="button" class="btn-danger" data-action="cancel" data-job-id="' + escapeHtml(job.job_id) + '">Cancel</button>';
       }
-      if (target.dataset.action === 'copy-temp') {
-        var code = document.getElementById('tempUrlRef');
-        if (code) {
-          navigator.clipboard.writeText(code.textContent).then(function() { target.textContent = 'Copied!'; });
-        }
+      if (job.temp_url && job.temp_path && job.status !== 'destroyed' && job.status !== 'expired') {
+        actions += '<button type="button" class="btn-secondary" data-action="copy-temp-url" data-temp-url="' + escapeHtml(job.temp_url) + '">Copy URL</button>';
       }
+      if (job.temp_path && job.status !== 'destroyed' && job.status !== 'expired') {
+        actions += '<button type="button" class="btn-danger" data-action="destroy" data-job-id="' + escapeHtml(job.job_id) + '">Destroy</button>';
+      }
+
+      let tempUrl = '';
+      if (job.temp_url && job.temp_path) {
+        tempUrl = '<div class="temp-url"><strong>Temp URL</strong><br>' + escapeHtml(job.temp_url) + '</div>';
+      }
+
+      const progress = TERMINAL_STATUSES.has(job.status) && job.status !== 'downloaded'
+        ? ''
+        : '<div class="bar"><div class="bar-fill" style="width:' + pct + '%"></div></div>';
+
+      const meta = []
+        .concat(job.download_only ? ['download only'] : [])
+        .concat(job.file_name ? [job.file_name] : [])
+        .concat(job.updated_ts ? ['updated ' + new Date(job.updated_ts * 1000).toLocaleTimeString()] : []);
+
+      return ''
+        + '<article class="job-card" data-status="' + escapeHtml(job.status) + '">'
+        +   '<div class="job-head">'
+        +     '<div>'
+        +       '<h4 class="job-title">' + escapeHtml(label) + '</h4>'
+        +       (job.link ? '<div class="job-link">' + escapeHtml(job.link) + '</div>' : '')
+        +     '</div>'
+        +     '<span class="' + badgeClass(job.status) + '">' + escapeHtml(job.status) + '</span>'
+        +   '</div>'
+        +   '<div class="job-message">' + escapeHtml(job.message || job.status) + '</div>'
+        +   progress
+        +   (meta.length ? '<div class="meta-row">' + meta.map((item) => '<span>' + escapeHtml(item) + '</span>').join('') + '</div>' : '')
+        +   tempUrl
+        +   (actions ? '<div class="job-actions">' + actions + '</div>' : '')
+        + '</article>';
+    }
+
+    async function refreshHealth() {
+      try {
+        const health = await apiJson('/api/health');
+        serverStatusEl.innerHTML = ''
+          + '<span class="pill ' + (health.telegram === 'connected' ? 'good' : 'bad') + '">'
+          + (health.telegram === 'connected' ? 'Telegram connected' : 'Telegram not logged in')
+          + '</span>'
+          + '<span class="pill">' + escapeHtml(String(health.active_jobs)) + ' active jobs</span>'
+          + '<span class="pill ' + (health.ffmpeg_available ? 'good' : 'bad') + '">'
+          + (health.ffmpeg_available ? 'ffmpeg ready' : 'ffmpeg missing')
+          + '</span>';
+      } catch (_) {
+        serverStatusEl.innerHTML = '<span class="pill bad">Server unreachable</span>';
+      }
+    }
+
+    async function refreshJobs() {
+      try {
+        const list = await apiJson('/api/jobs?limit=50');
+        const active = list.filter((job) => !TERMINAL_STATUSES.has(job.status));
+        const recent = list.filter((job) => TERMINAL_STATUSES.has(job.status));
+        activeCountEl.textContent = active.length + ' active';
+        activeJobsEl.innerHTML = active.length ? active.map(renderJob).join('') : '<div class="empty">No active jobs right now. Queue up to 3 Telegram links and they will appear here immediately.</div>';
+        recentJobsEl.innerHTML = recent.length ? recent.map(renderJob).join('') : '<div class="empty">Finished, failed, destroyed, and expired jobs will collect here.</div>';
+      } catch (error) {
+        activeJobsEl.innerHTML = '<div class="empty">Could not load jobs: ' + escapeHtml(error.message || 'unknown error') + '</div>';
+      }
+    }
+
+    jobsPanel.addEventListener('click', async (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+
       if (target.dataset.action === 'copy-temp-url' && target.dataset.tempUrl) {
-        navigator.clipboard.writeText(target.dataset.tempUrl).then(function() { target.textContent = 'Copied!'; });
+        try {
+          await navigator.clipboard.writeText(target.dataset.tempUrl);
+          showNotice('Temporary URL copied.', 'ok');
+        } catch (_) {
+          showNotice('Clipboard access failed. Copy the URL manually.', 'error');
+        }
+        return;
       }
+
+      if (target.dataset.action === 'cancel' && target.dataset.jobId) {
+        try {
+          await apiJson('/api/cancel?job_id=' + encodeURIComponent(target.dataset.jobId), { method: 'POST' });
+          showNotice('Cancellation requested.', 'ok');
+          await refreshJobs();
+        } catch (error) {
+          showNotice(error.message || 'Cancel failed.', 'error');
+        }
+        return;
+      }
+
       if (target.dataset.action === 'destroy' && target.dataset.jobId) {
-        apiJson('/api/destroy/' + encodeURIComponent(target.dataset.jobId), { method: 'POST' }).then(function(data) {
-          if (data.ok) {
-            showStatus('<p><strong>File deleted.</strong></p><div class="status-actions"><button type="button" class="btn-secondary btn-sm" data-action="clear">Clear</button></div>', '');
-            refreshJobs();
-          } else {
-            showStatus('<p class="failed">' + escapeHtml(data.message || 'Destroy failed') + '</p>', 'failed');
-          }
-        }).catch(function(err) {
-          showStatus('<p class="failed">' + escapeHtml(err.message || 'Destroy failed') + '</p>', 'failed');
-        });
-      }
-      if (target.dataset.action === 'clear') {
-        showStatus('', '');
-        statusEl.style.display = 'none';
+        try {
+          await apiJson('/api/destroy/' + encodeURIComponent(target.dataset.jobId), { method: 'POST' });
+          showNotice('Temporary file destroyed.', 'ok');
+          await refreshJobs();
+        } catch (error) {
+          showNotice(error.message || 'Destroy failed.', 'error');
+        }
       }
     });
 
-    form.addEventListener('submit', async (e) => {
-      e.preventDefault();
-      const link = linkInput.value.trim();
-      if (!link) return;
-      btn.disabled = true;
-      showStatus('<p>Starting…</p>', '');
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const raw = linksInput.value.trim();
+      const links = splitLinks(raw);
+      if (!links.length) {
+        showNotice('Paste at least one Telegram message link.', 'error');
+        return;
+      }
+
+      submitBtn.disabled = true;
+      showNotice('Submitting jobs…', 'ok');
       try {
-        const downloadOnly = document.getElementById('downloadOnly').checked;
+        const payload = {
+          links: links,
+          download_only: document.getElementById('downloadOnly').checked
+        };
         const data = await apiJson('/api/process', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ link: link, download_only: downloadOnly })
+          body: JSON.stringify(payload)
         });
-        poll(data.job_id);
-      } catch (err) {
-        showStatus('<p class="failed">' + escapeHtml(err.message) + '</p>', 'failed');
-        btn.disabled = false;
+        const count = Array.isArray(data.jobs) ? data.jobs.length : 0;
+        showNotice('Queued ' + count + ' job' + (count === 1 ? '' : 's') + '.', 'ok');
+        linksInput.value = '';
+        await refreshJobs();
+      } catch (error) {
+        showNotice(error.message || 'Could not queue jobs.', 'error');
+      } finally {
+        submitBtn.disabled = false;
       }
     });
+
+    refreshHealth();
+    refreshJobs();
+    setInterval(refreshHealth, 60000);
+    setInterval(refreshJobs, 2000);
   </script>
 </body>
 </html>"""
@@ -573,6 +983,7 @@ async def index():
 if __name__ == "__main__":
     import os
     import uvicorn
+
     logging.basicConfig(level=logging.INFO, format="%(message)s")
     port = int(os.environ.get("PORT", "8765"))
     uvicorn.run("app.web:app", host="0.0.0.0", port=port, reload=False)

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 
 
@@ -12,6 +13,7 @@ class VideoStreamInfo:
     width: int | None
     height: int | None
     pix_fmt: str | None
+    frame_rate: float | None
 
 
 @dataclass(slots=True)
@@ -47,6 +49,15 @@ def _to_float(value: object) -> float | None:
     try:
         return float(value)
     except (TypeError, ValueError):
+        return None
+
+
+def _to_frame_rate(value: object) -> float | None:
+    if value in (None, "", "0/0"):
+        return None
+    try:
+        return float(Fraction(str(value)))
+    except (ValueError, ZeroDivisionError):
         return None
 
 
@@ -104,6 +115,7 @@ def probe_media(ffprobe_binary: str, input_path: Path) -> MediaProbeResult:
                 width=_to_int(stream.get("width")),
                 height=_to_int(stream.get("height")),
                 pix_fmt=str(stream.get("pix_fmt")) if stream.get("pix_fmt") else None,
+                frame_rate=_to_frame_rate(stream.get("avg_frame_rate") or stream.get("r_frame_rate")),
             )
         elif codec_type == "audio" and audio_stream is None:
             audio_stream = AudioStreamInfo(
