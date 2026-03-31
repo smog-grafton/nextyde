@@ -73,6 +73,7 @@ DB_PATH=./telebot_state.db
 MAX_CONCURRENT_DOWNLOADS=1
 MAX_CONCURRENT_TRANSCODES=1
 WEB_MAX_ACTIVE_JOBS=3
+WEB_RECENT_JOB_RETENTION_HOURS=24
 SCAN_LAST_MESSAGES=15
 CDN_UPLOAD_URL=https://cdn.naraboxtv.com/api/v1/media/telegram-intake
 CDN_API_TOKEN=replace_me
@@ -82,11 +83,12 @@ DEFAULT_CATEGORY=movies
 VIDEO_PREP_ENABLED=true
 VIDEO_PREP_MAX_HEIGHT=720
 VIDEO_PREP_CRF=22
-VIDEO_PREP_PRESET=veryfast
+VIDEO_PREP_PRESET=superfast
 VIDEO_PREP_MIN_SIZE_MB_FOR_TRANSCODE=50
 VIDEO_PREP_TARGET_MAX_MB=1024
+VIDEO_PREP_CAP_HEIGHT_LADDER=480,360
 VIDEO_PREP_KEEP_ORIGINAL_ON_SUCCESS=false
-VIDEO_PREP_TIMEOUT_SECONDS=7200
+VIDEO_PREP_TIMEOUT_SECONDS=21600
 TEMP_FILE_TTL_HOURS=24
 FFMPEG_BINARY=
 FFPROBE_BINARY=
@@ -100,6 +102,7 @@ After Telegram download, the worker:
 - Probes source media and decides whether to keep source or transcode
 - Transcodes to MP4 with `libx264` + `aac` + `+faststart` when needed
 - Enforces a hard size cap for oversized videos so exposed/uploaded files stay at or below `VIDEO_PREP_TARGET_MAX_MB`
+- Starts capped jobs from the lower `VIDEO_PREP_CAP_HEIGHT_LADDER` so weaker VPS instances do not waste hours trying a too-heavy first pass
 - Keeps only primary video and first audio stream (`-map 0:v:0 -map 0:a:0?`)
 - Downscales oversized sources to a max height (default `720`) without upscaling
 
@@ -206,7 +209,7 @@ source .venv/bin/activate
 python -m app.web
 ```
 
-3. Open **http://127.0.0.1:8765** in your browser. Paste up to 3 message links (one per line), then queue the jobs. The dashboard shows active jobs and recent jobs separately, so refresh-safe actions like **Copy URL** and **Destroy** still work after the page reloads.
+3. Open **http://127.0.0.1:8765** in your browser. Paste up to 3 message links (one per line), then queue the jobs. The dashboard shows active jobs and recent jobs separately, so refresh-safe actions like **Copy URL** and **Destroy** still work after the page reloads. Terminal jobs are pruned from recent history automatically after `WEB_RECENT_JOB_RETENTION_HOURS`.
 
 **Download only:** Check **Download only (get link -> paste in CDN -> Destroy)** to skip CDN upload. The telebot downloads the file, finishes any required compression first, then shows a temporary URL that ends with the real final filename such as `.mp4` or `.mkv`. Copy that URL, paste it into your CDN’s “import from URL” (source URL), and after the CDN has fetched it, click **Destroy** to delete the temp file. Set `TEMP_PUBLIC_URL` to your telebot’s public URL (e.g. `https://teletyde.example.com`) so the link is reachable by the CDN. Forgotten download-only files are also cleaned up automatically after `TEMP_FILE_TTL_HOURS`.
 

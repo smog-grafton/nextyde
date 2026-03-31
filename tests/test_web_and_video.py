@@ -50,12 +50,14 @@ def make_settings(temp_dir: Path) -> Settings:
         video_prep_enabled=True,
         video_prep_max_height=720,
         video_prep_crf=22,
-        video_prep_preset="veryfast",
+        video_prep_preset="superfast",
         video_prep_min_size_mb_for_transcode=50,
         video_prep_target_max_mb=1024,
+        video_prep_cap_height_ladder=(480, 360),
         video_prep_keep_original_on_success=False,
-        video_prep_timeout_seconds=7200,
+        video_prep_timeout_seconds=21600,
         temp_file_ttl_hours=24,
+        web_recent_job_retention_hours=24,
     )
 
 
@@ -186,6 +188,43 @@ class WebBehaviorTests(unittest.IsolatedAsyncioTestCase):
         response = await web.api_temp_file_legacy("job-1")
         self.assertEqual(response.headers["location"], "/api/temp/job-1/movie.delivery.mp4")
 
+    def test_prune_recent_jobs_removes_old_terminal_entries(self) -> None:
+        web.jobs["old-failed"] = {
+            "job_id": "old-failed",
+            "status": "failed",
+            "progress_pct": 100,
+            "message": "ffmpeg timed out",
+            "file_name": "old.mp4",
+            "link": "https://t.me/demo/10",
+            "link_key": "demo:10",
+            "result": None,
+            "error": "ffmpeg timed out",
+            "temp_path": None,
+            "download_only": True,
+            "_ts": 1.0,
+            "updated_ts": 1.0,
+        }
+        web.jobs["fresh-downloaded"] = {
+            "job_id": "fresh-downloaded",
+            "status": "downloaded",
+            "progress_pct": 100,
+            "message": "Ready",
+            "file_name": "fresh.mp4",
+            "link": "https://t.me/demo/11",
+            "link_key": "demo:11",
+            "result": None,
+            "error": None,
+            "temp_path": "/tmp/fresh.mp4",
+            "download_only": True,
+            "_ts": 100.0,
+            "updated_ts": 100.0,
+        }
+
+        removed = web._prune_recent_jobs(web.worker, now=60 * 60 * 25)
+        self.assertEqual(removed, 1)
+        self.assertNotIn("old-failed", web.jobs)
+        self.assertIn("fresh-downloaded", web.jobs)
+
 
 class VideoPrepAnalysisTests(unittest.TestCase):
     def test_analyze_video_for_delivery_builds_capped_attempts(self) -> None:
@@ -207,7 +246,6 @@ class VideoPrepAnalysisTests(unittest.TestCase):
         self.assertTrue(analysis.decision.should_transcode)
         self.assertEqual(analysis.decision.mode, "cap")
         self.assertEqual(len(analysis.attempts), 3)
-        self.assertEqual([attempt.target_height for attempt in analysis.attempts], [720, 576, 480])
+        self.assertEqual([attempt.target_height for attempt in analysis.attempts], [480, 360, 360])
         self.assertGreater(analysis.attempts[0].video_bitrate_kbps, analysis.attempts[1].video_bitrate_kbps)
         self.assertGreater(analysis.attempts[1].video_bitrate_kbps, analysis.attempts[2].video_bitrate_kbps)
-

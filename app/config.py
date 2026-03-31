@@ -18,6 +18,19 @@ def _csv(name: str) -> List[str]:
     return [item.strip() for item in raw.split(",") if item.strip()]
 
 
+def _csv_ints(name: str, default: str) -> tuple[int, ...]:
+    raw = os.getenv(name, default).strip()
+    if not raw:
+        return ()
+    values: list[int] = []
+    for item in raw.split(","):
+        stripped = item.strip()
+        if not stripped:
+            continue
+        values.append(max(240, int(stripped)))
+    return tuple(values)
+
+
 def _bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
     if value is None:
@@ -64,9 +77,11 @@ class Settings:
     video_prep_preset: str
     video_prep_min_size_mb_for_transcode: int
     video_prep_target_max_mb: int
+    video_prep_cap_height_ladder: tuple[int, ...]
     video_prep_keep_original_on_success: bool
     video_prep_timeout_seconds: int
     temp_file_ttl_hours: int
+    web_recent_job_retention_hours: int
 
     @classmethod
     def load(cls) -> "Settings":
@@ -126,10 +141,12 @@ class Settings:
             video_prep_enabled=_bool("VIDEO_PREP_ENABLED", True),
             video_prep_max_height=max(240, int(os.getenv("VIDEO_PREP_MAX_HEIGHT", "720"))),
             video_prep_crf=min(35, max(16, int(os.getenv("VIDEO_PREP_CRF", "22")))),
-            video_prep_preset=(os.getenv("VIDEO_PREP_PRESET", "veryfast").strip() or "veryfast"),
+            video_prep_preset=(os.getenv("VIDEO_PREP_PRESET", "superfast").strip() or "superfast"),
             video_prep_min_size_mb_for_transcode=max(1, int(os.getenv("VIDEO_PREP_MIN_SIZE_MB_FOR_TRANSCODE", "50"))),
             video_prep_target_max_mb=max(1, int(os.getenv("VIDEO_PREP_TARGET_MAX_MB", "1024"))),
+            video_prep_cap_height_ladder=_csv_ints("VIDEO_PREP_CAP_HEIGHT_LADDER", "480,360"),
             video_prep_keep_original_on_success=_bool("VIDEO_PREP_KEEP_ORIGINAL_ON_SUCCESS", False),
-            video_prep_timeout_seconds=max(60, int(os.getenv("VIDEO_PREP_TIMEOUT_SECONDS", "7200"))),
+            video_prep_timeout_seconds=max(60, int(os.getenv("VIDEO_PREP_TIMEOUT_SECONDS", "21600"))),
             temp_file_ttl_hours=max(1, int(os.getenv("TEMP_FILE_TTL_HOURS", "24"))),
+            web_recent_job_retention_hours=max(1, int(os.getenv("WEB_RECENT_JOB_RETENTION_HOURS", "24"))),
         )

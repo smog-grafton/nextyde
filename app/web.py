@@ -42,6 +42,22 @@ def _active_job_count() -> int:
     return sum(1 for job in jobs.values() if not _is_terminal_status(job.get("status")))
 
 
+def _prune_recent_jobs(current_worker: TelegramPipeWorker | None, now: float | None = None) -> int:
+    if current_worker is None:
+        return 0
+    retention_seconds = current_worker.settings.web_recent_job_retention_hours * 3600
+    current_time = now if now is not None else time.time()
+    removable_ids = [
+        job_id
+        for job_id, job in jobs.items()
+        if _is_terminal_status(job.get("status"))
+        and (current_time - float(job.get("updated_ts", job.get("_ts", current_time)))) > retention_seconds
+    ]
+    for job_id in removable_ids:
+        jobs.pop(job_id, None)
+    return len(removable_ids)
+
+
 def _build_temp_url(current_worker: TelegramPipeWorker | None, job: dict) -> str | None:
     if not current_worker:
         return None
@@ -229,6 +245,7 @@ async def api_process(req: ProcessRequest):
             detail="Telegram not logged in. Run 'python main.py' once, enter the code, then restart the web app.",
         )
 
+    _prune_recent_jobs(worker)
     normalized_links = _normalize_links(req.link, req.links)
     download_only = req.download_only or worker.settings.download_only
 
@@ -282,6 +299,7 @@ async def api_process(req: ProcessRequest):
 
 @app.get("/api/status")
 async def api_status(job_id: str):
+    _prune_recent_jobs(worker)
     if job_id not in jobs:
         raise HTTPException(404, detail="Job not found")
     return _job_with_temp_url(jobs[job_id], worker)
@@ -289,6 +307,7 @@ async def api_status(job_id: str):
 
 @app.post("/api/cancel")
 async def api_cancel(job_id: str):
+    _prune_recent_jobs(worker)
     if job_id not in jobs:
         raise HTTPException(404, detail="Job not found")
     job = jobs[job_id]
@@ -335,6 +354,7 @@ async def api_temp_file_legacy(job_id: str):
 
 @app.post("/api/destroy/{job_id}")
 async def api_destroy(job_id: str):
+    _prune_recent_jobs(worker)
     if job_id not in jobs:
         raise HTTPException(404, detail="Job not found")
 
@@ -369,6 +389,7 @@ async def api_destroy(job_id: str):
 
 @app.get("/api/jobs")
 async def api_jobs(limit: int = 30):
+    _prune_recent_jobs(worker)
     order = sorted(
         jobs.items(),
         key=lambda item: (item[1].get("updated_ts", item[1].get("_ts", 0)), item[1].get("_ts", 0)),
@@ -755,7 +776,7 @@ def _html() -> str:
         <div class="panel">
           <div class="section-head">
             <h3>Recent jobs</h3>
-            <span>Refresh-safe copy and destroy controls stay here too.</span>
+            <span>Refresh-safe actions stay here too, and old finished entries are pruned automatically.</span>
           </div>
           <div class="job-grid" id="recentJobs"></div>
         </div>

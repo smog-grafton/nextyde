@@ -15,7 +15,7 @@ from app.media_tools import require_media_tools
 LOGGER = logging.getLogger("telebot")
 PrepProgressCallback = Callable[[str, dict[str, float | int | str | None]], None]
 CancelCheck = Callable[[], bool]
-HEIGHT_LADDER = (720, 576, 480, 360)
+DEFAULT_CAP_HEIGHT_LADDER = (480, 360)
 CAP_OVERHEAD_RATIO = 0.97
 CAP_AUDIO_BITRATE_KBPS = 96
 MIN_VIDEO_BITRATE_KBPS = 150
@@ -73,9 +73,14 @@ def _build_output_path(input_path: Path) -> Path:
     return input_path.with_name(f"{input_path.stem}.delivery.mp4")
 
 
-def _build_height_candidates(source_height: int | None, max_height: int) -> tuple[int | None, ...]:
+def _build_height_candidates(
+    source_height: int | None,
+    max_height: int,
+    preferred_heights: tuple[int, ...] | None = None,
+) -> tuple[int | None, ...]:
     capped_max_height = max(240, max_height)
-    candidates = [height for height in HEIGHT_LADDER if height <= capped_max_height]
+    ladder = tuple(height for height in (preferred_heights or DEFAULT_CAP_HEIGHT_LADDER) if height > 0) or DEFAULT_CAP_HEIGHT_LADDER
+    candidates = [height for height in ladder if height <= capped_max_height]
     if source_height:
         candidates = [height for height in candidates if height <= source_height]
     if candidates:
@@ -105,6 +110,7 @@ def _build_cap_attempts(settings: Settings, probe: MediaProbeResult, target_max_
     height_candidates = _build_height_candidates(
         probe.video.height if probe.video else None,
         settings.video_prep_max_height,
+        settings.video_prep_cap_height_ladder or DEFAULT_CAP_HEIGHT_LADDER,
     )
 
     attempts: list[VideoPrepAttempt] = []
