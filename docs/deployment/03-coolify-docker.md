@@ -2,6 +2,33 @@
 
 `telebot` already includes its own Dockerfile. In Coolify you can deploy it as a web UI service, a watcher service, or both. The default container command runs the web UI on port `8765`.
 
+## Existing production resource: add this delta
+
+If your telebot Coolify resource is already running with the usual Telegram and web variables, the important worker-integration delta is:
+
+```env
+# Change this away from the old CDN intake if Laravel worker is now the intake target.
+CDN_UPLOAD_URL=https://worker.example.com/api/v1/media/telegram-intake
+
+# Recommended for separate Coolify containers, even on the same host.
+CDN_HANDOFF_MODE=source_url
+WORKER_HANDLES_VIDEO_PREP=true
+
+# Required for source_url handoff.
+TEMP_PUBLIC_URL=https://telebot.example.com
+TEMP_URL_SECRET=replace_me
+
+# Keep the web app attached to Telegram in the main service.
+WEB_DISABLE_TELEGRAM=false
+DOWNLOAD_ONLY=false
+```
+
+Notes:
+
+- `MAX_CONCURRENT_UPLOADS` is a legacy variable from older deployments and the current telebot code does not read it. You can leave it in Coolify, but it has no effect.
+- If you want `path_copy` instead of `source_url`, both containers must mount the same shared intake volume. Being on the same server is not enough by itself.
+- Keep `VIDEO_PREP_ENABLED=true` if you still want download-only jobs to optimize locally, but normal worker handoffs will skip local prep when `WORKER_HANDLES_VIDEO_PREP=true`.
+
 ## Recommended service split
 
 ### 1. Web UI service

@@ -2,6 +2,8 @@
 
 Use this when telebot and the Laravel worker are on different servers. Telebot exposes a signed temporary fetch URL, then the worker downloads it remotely through `source_url`.
 
+This is also the recommended option when both apps run in separate Coolify containers on the same host but do not share a mounted intake volume.
+
 ## Flow
 
 1. Telebot downloads the Telegram file.
