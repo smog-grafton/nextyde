@@ -12,9 +12,9 @@ For large movie files, a normal Bot API bot is a bad fit. The Bot API download l
 - Optionally auto-joins channels on startup
 - Catches up on the last N messages on boot
 - Downloads supported video files to a temp directory
-- Probes downloaded media with ffprobe and prepares a delivery-optimized MP4 when needed
+- Hands the original Telegram file to the Laravel worker for probing, transcoding, and compression
 - Extracts basic metadata from filenames like `28 YEARS LATER=1 VJ JOZZ UG.mkv`
-- Uploads the file to your CDN over HTTP
+- Hands the file off to your worker/CDN over HTTP
 - Records processed Telegram message IDs in SQLite so duplicates are skipped
 - Deletes the temp file after upload
 
@@ -27,9 +27,15 @@ For large movie files, a normal Bot API bot is a bad fit. The Bot API download l
 - `.m4v`
 - `.webm`
 
+## Deployment guides
+
+- [Same server with shared intake path](docs/deployment/01-same-server-path-copy.md)
+- [Cross-server pull handoff with signed source URLs](docs/deployment/02-cross-server-source-url.md)
+- [Coolify and Docker deployment](docs/deployment/03-coolify-docker.md)
+
 ## Expected CDN contract
 
-Set `CDN_UPLOAD_URL` to an endpoint in `naraboxtv-cdn` that accepts a multipart upload with:
+Set `CDN_UPLOAD_URL` to the destination intake endpoint. It can still be a CDN endpoint, but it can now also point to the Laravel FFmpeg worker intake endpoint.
 
 - `file` → uploaded file
 - `source` → `telegram`
@@ -44,7 +50,24 @@ Set `CDN_UPLOAD_URL` to an endpoint in `naraboxtv-cdn` that accepts a multipart 
 - `telegram_message_id`
 - `telegram_channel`
 
-If your CDN already has a manual remote-fetch endpoint but no direct upload endpoint, add a small authenticated upload route there first. This worker is already prepared for that contract.
+For the new Laravel worker flow on the same server, prefer path handoff instead of multipart upload:
+
+- `CDN_UPLOAD_URL=https://your-worker.example.com/api/v1/media/telegram-intake`
+- `CDN_API_TOKEN=<same as TELEGRAM_INGEST_TOKEN on the worker>`
+- `CDN_HANDOFF_MODE=path_copy`
+- `CDN_SHARED_INTAKE_ROOT=/Applications/XAMPP/xamppfiles/htdocs/ffmpeg-worker/storage/app/telegram-intake`
+- `CDN_SHARED_INTAKE_DISK=telegram-intake`
+- `WORKER_HANDLES_VIDEO_PREP=true`
+
+That mode copies the original downloaded file into the worker intake disk and only POSTs metadata + `source_path`, which avoids large HTTP uploads timing out.
+
+If telebot and the Laravel worker are on different servers, you can also use a signed temp URL handoff:
+
+- `CDN_HANDOFF_MODE=source_url`
+- `TEMP_PUBLIC_URL=https://telebot.example.com`
+- `TEMP_URL_SECRET=<optional, defaults to CDN_API_TOKEN>`
+
+That mode keeps the downloaded file in telebot temp storage, generates a signed direct file URL with the real extension, and POSTs that URL to Laravel as `source_url`.
 
 ## Local setup
 
@@ -77,6 +100,12 @@ WEB_RECENT_JOB_RETENTION_HOURS=24
 SCAN_LAST_MESSAGES=15
 CDN_UPLOAD_URL=https://cdn.naraboxtv.com/api/v1/media/telegram-intake
 CDN_API_TOKEN=replace_me
+CDN_HANDOFF_MODE=path_copy
+CDN_SHARED_INTAKE_ROOT=/Applications/XAMPP/xamppfiles/htdocs/ffmpeg-worker/storage/app/telegram-intake
+CDN_SHARED_INTAKE_DISK=telegram-intake
+WORKER_HANDLES_VIDEO_PREP=true
+TEMP_PUBLIC_URL=https://telebot.example.com
+TEMP_URL_SECRET=replace_me
 CDN_NOTIFY_URL=https://portal.naraboxtv.com/api/telegram/ingest-notify
 CDN_NOTIFY_TOKEN=replace_me
 DEFAULT_CATEGORY=movies
@@ -96,7 +125,9 @@ FFPROBE_BINARY=
 
 ### Video preparation behavior
 
-After Telegram download, the worker:
+When `WORKER_HANDLES_VIDEO_PREP=true`, telebot skips local transcoding/compression for normal worker handoffs and sends the original download to Laravel instead. The local video prep settings below only apply when you disable that delegation or when you use **Download only** mode.
+
+If local video prep is active, telebot:
 
 - Detects `ffmpeg`/`ffprobe` at runtime (env override first, then `PATH`, with `-version` validation)
 - Probes source media and decides whether to keep source or transcode
@@ -160,11 +191,17 @@ Add all required env vars in Coolify’s **Environment Variables** for this serv
 | `TG_2FA_PASSWORD` | If 2FA enabled | your password |
 | `CDN_UPLOAD_URL` | Yes | https://cdn.naraboxtv.com/api/v1/media/telegram-intake |
 | `CDN_API_TOKEN` | Yes | Same token as portal uses for CDN |
+| `CDN_HANDOFF_MODE` | No | `upload`, `path_copy`, or `source_url` |
+| `CDN_SHARED_INTAKE_ROOT` | If `CDN_HANDOFF_MODE=path_copy` | `/Applications/XAMPP/xamppfiles/htdocs/ffmpeg-worker/storage/app/telegram-intake` |
+| `CDN_SHARED_INTAKE_DISK` | No | `telegram-intake` |
+| `TEMP_PUBLIC_URL` | If `CDN_HANDOFF_MODE=source_url` or Download only | `https://telebot.example.com` |
+| `TEMP_URL_SECRET` | No | Reuses `CDN_API_TOKEN` if blank |
 | `CDN_NOTIFY_URL` | No | https://portal.naraboxtv.com/api/telegram/ingest-notify |
 | `CDN_NOTIFY_TOKEN` | No | TELEGRAM_INGEST_NOTIFY_TOKEN from portal |
 | `TEMP_DIR` | No | /tmp/telebot |
 | `DB_PATH` | No | /data/telebot_state.db (use a path on a persistent volume) |
 | `PORT` | No (default 8765) | Web UI port; set in Coolify if your host port mapping differs |
+| `WEB_DISABLE_TELEGRAM` | No | `true` to run the web app only as a signed temp-file server |
 
 For **Web UI only**, you can leave `TG_WATCH_TARGETS` and `TG_JOIN_TARGETS` empty.
 
@@ -199,7 +236,7 @@ If the app logs show `Uvicorn running on http://0.0.0.0:8765` and deployment suc
 
 ## Web UI
 
-A local dashboard to paste 1 to 3 Telegram message links at once and run download -> prepare -> CDN or expose a temporary fetch URL.
+A local dashboard to paste 1 to 3 Telegram message links at once and run download -> worker handoff or expose a temporary fetch URL.
 
 1. Log in once (so the session exists): run `python main.py`, enter the Telegram code, then stop it (Ctrl+C).
 2. Start the web app:
@@ -211,7 +248,9 @@ python -m app.web
 
 3. Open **http://127.0.0.1:8765** in your browser. Paste up to 3 message links (one per line), then queue the jobs. The dashboard shows active jobs and recent jobs separately, so refresh-safe actions like **Copy URL** and **Destroy** still work after the page reloads. Terminal jobs are pruned from recent history automatically after `WEB_RECENT_JOB_RETENTION_HOURS`.
 
-**Download only:** Check **Download only (get link -> paste in CDN -> Destroy)** to skip CDN upload. The telebot downloads the file, finishes any required compression first, then shows a temporary URL that ends with the real final filename such as `.mp4` or `.mkv`. Copy that URL, paste it into your CDN’s “import from URL” (source URL), and after the CDN has fetched it, click **Destroy** to delete the temp file. Set `TEMP_PUBLIC_URL` to your telebot’s public URL (e.g. `https://teletyde.example.com`) so the link is reachable by the CDN. Forgotten download-only files are also cleaned up automatically after `TEMP_FILE_TTL_HOURS`.
+**Download only:** Check **Download only (get link -> paste in CDN -> Destroy)** to skip the worker/CDN handoff. Telebot exposes the downloaded file at a temporary URL; if local video prep is still enabled, it will optimize the file first, otherwise it exposes the original download as-is. The exposed URL always keeps the real file extension and normalizes the filename so there are no spaces in the URL path. Copy that URL, paste it into your CDN’s “import from URL” (source URL), and after the CDN has fetched it, click **Destroy** to delete the temp file. Set `TEMP_PUBLIC_URL` to your telebot’s public URL (e.g. `https://teletyde.example.com`) so the link is reachable by the CDN. Forgotten download-only files are also cleaned up automatically after `TEMP_FILE_TTL_HOURS`.
+
+**Automatic remote-worker handoff:** Set `CDN_HANDOFF_MODE=source_url` when telebot and the Laravel worker do not share a filesystem. Telebot will generate a signed temp file URL like `https://telebot.example.com/api/fetch/.../movie-final-cut.mkv` and pass it to the Laravel worker automatically as `source_url`, so there is nothing to copy by hand.
 
 ### Does the Web UI work with any channel?
 

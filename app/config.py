@@ -64,11 +64,16 @@ class Settings:
     cdn_source: str
     cdn_notify_url: str | None
     cdn_notify_token: str | None
+    cdn_handoff_mode: str
+    worker_intake_root: Path | None
+    worker_intake_disk: str
+    worker_handles_video_prep: bool
     default_category: str | None
     default_language: str | None
     default_vj: str | None
     download_only: bool
     temp_public_url: str
+    temp_url_secret: str
     ffmpeg_binary: str | None
     ffprobe_binary: str | None
     video_prep_enabled: bool
@@ -83,6 +88,13 @@ class Settings:
     temp_file_ttl_hours: int
     web_recent_job_retention_hours: int
 
+    def should_prepare_video_locally(self, *, download_only: bool = False) -> bool:
+        if not self.video_prep_enabled:
+            return False
+        if download_only:
+            return True
+        return not self.worker_handles_video_prep
+
     @classmethod
     def load(cls) -> "Settings":
         api_id = os.getenv("TG_API_ID", "").strip()
@@ -90,6 +102,9 @@ class Settings:
         tg_phone = os.getenv("TG_PHONE", "").strip()
         cdn_upload_url = os.getenv("CDN_UPLOAD_URL", "").strip()
         download_only = _bool("DOWNLOAD_ONLY", False)
+        handoff_mode = os.getenv("CDN_HANDOFF_MODE", "upload").strip().lower() or "upload"
+        temp_public_url = os.getenv("TEMP_PUBLIC_URL", "").strip()
+        temp_url_secret = (os.getenv("TEMP_URL_SECRET") or os.getenv("CDN_API_TOKEN") or "").strip()
 
         missing = []
         if not api_id:
@@ -100,6 +115,10 @@ class Settings:
             missing.append("TG_PHONE")
         if not download_only and not cdn_upload_url:
             missing.append("CDN_UPLOAD_URL")
+        if handoff_mode == "source_url" and not temp_public_url:
+            missing.append("TEMP_PUBLIC_URL")
+        if handoff_mode == "source_url" and not temp_url_secret:
+            missing.append("TEMP_URL_SECRET (or CDN_API_TOKEN)")
         if missing:
             raise RuntimeError(f"Missing required environment variables: {', '.join(missing)}")
 
@@ -131,11 +150,23 @@ class Settings:
             cdn_source=os.getenv("CDN_SOURCE", "telegram").strip() or "telegram",
             cdn_notify_url=os.getenv("CDN_NOTIFY_URL") or None,
             cdn_notify_token=os.getenv("CDN_NOTIFY_TOKEN") or None,
+            cdn_handoff_mode=handoff_mode,
+            worker_intake_root=(
+                Path(os.getenv("CDN_SHARED_INTAKE_ROOT", "")).expanduser().resolve()
+                if os.getenv("CDN_SHARED_INTAKE_ROOT", "").strip()
+                else None
+            ),
+            worker_intake_disk=(os.getenv("CDN_SHARED_INTAKE_DISK", "telegram-intake").strip() or "telegram-intake"),
+            worker_handles_video_prep=_bool(
+                "WORKER_HANDLES_VIDEO_PREP",
+                handoff_mode in {"path_copy", "source_url"},
+            ),
             default_category=os.getenv("DEFAULT_CATEGORY") or None,
             default_language=os.getenv("DEFAULT_LANGUAGE") or None,
             default_vj=os.getenv("DEFAULT_VJ") or None,
             download_only=download_only,
-            temp_public_url=os.getenv("TEMP_PUBLIC_URL", "").strip(),
+            temp_public_url=temp_public_url,
+            temp_url_secret=temp_url_secret,
             ffmpeg_binary=(os.getenv("FFMPEG_BINARY") or "").strip() or None,
             ffprobe_binary=(os.getenv("FFPROBE_BINARY") or "").strip() or None,
             video_prep_enabled=_bool("VIDEO_PREP_ENABLED", True),

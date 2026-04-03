@@ -2,15 +2,19 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from fastapi import HTTPException
 
 from app import web
 from app.config import Settings
+from app.filename import storage_safe_filename
 from app.media_probe import AudioStreamInfo, MediaProbeResult, VideoStreamInfo
+from app.temp_url import build_signed_temp_url
+from app.telegram_worker import TelegramPipeWorker
 from app.video_prepare import analyze_video_for_delivery
 
 
@@ -40,11 +44,16 @@ def make_settings(temp_dir: Path) -> Settings:
         cdn_source="telegram",
         cdn_notify_url=None,
         cdn_notify_token=None,
+        cdn_handoff_mode="upload",
+        worker_intake_root=None,
+        worker_intake_disk="telegram-intake",
+        worker_handles_video_prep=False,
         default_category=None,
         default_language=None,
         default_vj=None,
         download_only=False,
         temp_public_url="https://telebot.example.com",
+        temp_url_secret="telebot-secret",
         ffmpeg_binary=None,
         ffprobe_binary=None,
         video_prep_enabled=True,
@@ -75,18 +84,22 @@ class DummyWorker:
 class WebBehaviorTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.old_worker = web.worker
+        self.old_app_settings = web.app_settings
         self.old_authorized = web.authorized
         self.old_jobs = dict(web.jobs)
         web.jobs.clear()
         self.temp_dir_ctx = tempfile.TemporaryDirectory()
         self.temp_dir = Path(self.temp_dir_ctx.name)
-        web.worker = DummyWorker(make_settings(self.temp_dir))
+        settings = make_settings(self.temp_dir)
+        web.worker = DummyWorker(settings)
+        web.app_settings = settings
         web.authorized = True
 
     async def asyncTearDown(self) -> None:
         web.jobs.clear()
         web.jobs.update(self.old_jobs)
         web.worker = self.old_worker
+        web.app_settings = self.old_app_settings
         web.authorized = self.old_authorized
         self.temp_dir_ctx.cleanup()
 
@@ -188,6 +201,17 @@ class WebBehaviorTests(unittest.IsolatedAsyncioTestCase):
         response = await web.api_temp_file_legacy("job-1")
         self.assertEqual(response.headers["location"], "/api/temp/job-1/movie.delivery.mp4")
 
+    async def test_signed_fetch_url_resolves_real_file(self) -> None:
+        file_path = self.temp_dir / "watcher" / "movie-final-cut.mkv"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_bytes(b"video")
+
+        signed_url = build_signed_temp_url(web.app_settings, file_path)
+        token = signed_url.split("/api/fetch/", 1)[1].split("/", 1)[0]
+
+        response = await web.api_fetch_file(token, "movie-final-cut.mkv")
+        self.assertIn("movie-final-cut.mkv", response.headers["content-disposition"])
+
     def test_prune_recent_jobs_removes_old_terminal_entries(self) -> None:
         web.jobs["old-failed"] = {
             "job_id": "old-failed",
@@ -227,6 +251,16 @@ class WebBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
 
 class VideoPrepAnalysisTests(unittest.TestCase):
+    def test_storage_safe_filename_removes_spaces_but_keeps_extension(self) -> None:
+        self.assertEqual(storage_safe_filename("My Movie Final Cut.mkv"), "My-Movie-Final-Cut.mkv")
+
+    def test_worker_handoff_skips_local_prep_for_normal_jobs(self) -> None:
+        settings = make_settings(Path("/tmp/telebot-tests"))
+        settings.worker_handles_video_prep = True
+
+        self.assertFalse(settings.should_prepare_video_locally())
+        self.assertTrue(settings.should_prepare_video_locally(download_only=True))
+
     def test_analyze_video_for_delivery_builds_capped_attempts(self) -> None:
         source_probe = MediaProbeResult(
             path=Path("/tmp/movie.mkv"),
@@ -249,3 +283,110 @@ class VideoPrepAnalysisTests(unittest.TestCase):
         self.assertEqual([attempt.target_height for attempt in analysis.attempts], [480, 360, 360])
         self.assertGreater(analysis.attempts[0].video_bitrate_kbps, analysis.attempts[1].video_bitrate_kbps)
         self.assertGreater(analysis.attempts[1].video_bitrate_kbps, analysis.attempts[2].video_bitrate_kbps)
+
+
+class TelegramWorkerBehaviorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_worker_handoff_uses_original_file_without_local_transcode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            settings = make_settings(Path(temp_dir_name))
+            settings.cdn_handoff_mode = "path_copy"
+            settings.worker_handles_video_prep = True
+            settings.video_prep_enabled = True
+
+            worker = TelegramPipeWorker(settings)
+            await worker.cdn.close()
+            worker.store = SimpleNamespace(
+                is_processed=AsyncMock(return_value=False),
+                mark_processed=AsyncMock(),
+            )
+            worker.cdn = SimpleNamespace(
+                upload_file=AsyncMock(return_value={"data": {"media_item_id": 123}}),
+                notify=AsyncMock(),
+            )
+
+            async def instant_acquire(semaphore, progress_extra=None) -> None:
+                await semaphore.acquire()
+
+            async def fake_download(message, destination, progress_callback=None) -> None:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"video")
+                if progress_callback is not None:
+                    progress_callback(1, 1)
+
+            worker._acquire_stage_slot = instant_acquire
+            worker._download_media_to_path = fake_download
+
+            message = SimpleNamespace(
+                id=456,
+                file=SimpleNamespace(name="movie final cut.mkv", size=1024, mime_type="video/x-matroska"),
+                document=SimpleNamespace(attributes=[]),
+                date=datetime.now(timezone.utc),
+                get_chat=AsyncMock(return_value=SimpleNamespace(id=789, title="Demo Channel")),
+            )
+
+            with patch("app.telegram_worker.analyze_video_for_delivery", side_effect=AssertionError("analyze should not run")):
+                with patch("app.telegram_worker.prepare_video_for_delivery", side_effect=AssertionError("prepare should not run")):
+                    await worker._handle_message(message, catch_up=False)
+
+            upload_call = worker.cdn.upload_file.await_args
+            upload_path = upload_call.args[0]
+            upload_metadata = upload_call.args[1]
+
+            self.assertEqual(upload_path.name, "movie-final-cut.mkv")
+            self.assertTrue(upload_metadata["video_prep_delegated_to_worker"])
+            self.assertEqual(upload_metadata["video_prep_mode"], "worker")
+            self.assertEqual(worker.store.mark_processed.await_args.args[2], "movie-final-cut.mkv")
+
+    async def test_source_url_handoff_passes_signed_temp_url_and_keeps_file(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            settings = make_settings(Path(temp_dir_name))
+            settings.cdn_handoff_mode = "source_url"
+            settings.worker_handles_video_prep = True
+            settings.video_prep_enabled = True
+
+            worker = TelegramPipeWorker(settings)
+            await worker.cdn.close()
+            worker.store = SimpleNamespace(
+                is_processed=AsyncMock(return_value=False),
+                mark_processed=AsyncMock(),
+            )
+            worker.cdn = SimpleNamespace(
+                upload_file=AsyncMock(return_value={"data": {"media_item_id": 123, "uuid": "demo-uuid"}}),
+                notify=AsyncMock(),
+            )
+
+            async def instant_acquire(semaphore, progress_extra=None) -> None:
+                await semaphore.acquire()
+
+            async def fake_download(message, destination, progress_callback=None) -> None:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"video")
+                if progress_callback is not None:
+                    progress_callback(1, 1)
+
+            worker._acquire_stage_slot = instant_acquire
+            worker._download_media_to_path = fake_download
+
+            message = SimpleNamespace(
+                id=456,
+                file=SimpleNamespace(name="movie final cut.mkv", size=1024, mime_type="video/x-matroska"),
+                document=SimpleNamespace(attributes=[]),
+                date=datetime.now(timezone.utc),
+                get_chat=AsyncMock(return_value=SimpleNamespace(id=789, title="Demo Channel")),
+            )
+
+            await worker._handle_message(message, catch_up=False)
+
+            upload_call = worker.cdn.upload_file.await_args
+            upload_path = upload_call.args[0]
+            upload_metadata = upload_call.args[1]
+            upload_source_url = upload_call.kwargs["source_url"]
+
+            self.assertEqual(upload_path.name, "movie-final-cut.mkv")
+            self.assertEqual(upload_metadata["video_prep_mode"], "worker")
+            self.assertEqual(
+                upload_source_url,
+                "https://telebot.example.com/api/fetch/"
+                + upload_source_url.split("/api/fetch/", 1)[1],
+            )
+            self.assertTrue(upload_path.exists())

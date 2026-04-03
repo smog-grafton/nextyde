@@ -6,6 +6,7 @@ from pathlib import Path
 
 BAD_CHARS = re.compile(r"[^\w\-.()\[\] ]+", re.UNICODE)
 MULTI_SPACE = re.compile(r"\s+")
+MULTI_DASH = re.compile(r"-+")
 EPISODE_HINT = re.compile(r"=(\d{1,3})(?=\D|$)")
 VJ_HINT = re.compile(r"\bVJ\s+([A-Z0-9 _.-]+)$", re.IGNORECASE)
 
@@ -16,6 +17,18 @@ def sanitize_filename(name: str) -> str:
     base = BAD_CHARS.sub(" ", base)
     base = MULTI_SPACE.sub(" ", base).strip()
     return base or "telegram_media.bin"
+
+
+def storage_safe_filename(name: str) -> str:
+    cleaned = sanitize_filename(name)
+    path = Path(cleaned)
+    stem = MULTI_DASH.sub("-", MULTI_SPACE.sub("-", path.stem)).strip("-.")
+    extension = path.suffix.lower()
+
+    if not stem:
+        stem = "telegram_media"
+
+    return f"{stem}{extension}"
 
 
 

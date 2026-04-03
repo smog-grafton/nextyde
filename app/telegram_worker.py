@@ -19,9 +19,10 @@ from telethon.errors import UsernameInvalidError, UsernameNotOccupiedError
 from app.cdn_client import CdnClient
 from app.config import Settings
 from app.db import StateStore
-from app.filename import extract_metadata, sanitize_filename
+from app.filename import extract_metadata, storage_safe_filename
 from app.link_parser import TELEGRAM_LINK_RE
 from app.media_tools import detect_media_tools
+from app.temp_url import build_signed_temp_url
 from app.video_prepare import (
     VideoPrepCancelledError,
     analyze_video_for_delivery,
@@ -67,7 +68,7 @@ class TelegramPipeWorker:
         await self.store.init()
         self.settings.temp_dir.mkdir(parents=True, exist_ok=True)
         await self.start_housekeeping()
-        if self.settings.video_prep_enabled:
+        if self.settings.should_prepare_video_locally():
             tools = detect_media_tools()
             LOGGER.info(
                 "Video prep tools at startup: ffmpeg=%s ffprobe=%s",
@@ -397,13 +398,13 @@ class TelegramPipeWorker:
                 elif status == "waiting_to_prepare":
                     job["message"] = data.get("message", "Waiting for video slot…")
                 elif status == "uploading":
-                    job["message"] = "Uploading to CDN…"
+                    job["message"] = data.get("message", "Uploading to CDN…")
                     job["progress_pct"] = 99
                 elif status == "preparing":
                     job["message"] = data.get("message", "Preparing video…")
                     job["progress_pct"] = data.get("progress_pct", max(20, progress_extra.get("progress_pct", 20)))
                 elif status == "done":
-                    job["message"] = "Done. File deleted."
+                    job["message"] = data.get("message", "Done. File deleted.")
                     job["progress_pct"] = 100
                     job["result"] = data.get("cdn_response")
                 elif status == "downloaded":
@@ -457,8 +458,10 @@ class TelegramPipeWorker:
                 await self._invoke_progress(progress_callback, "skipped", {"message": "Already processed"})
             raise AlreadyProcessedError("Already processed (previous run succeeded or failed). Try another link.")
 
-        file_name = sanitize_filename(self._extract_file_name(message) or f"message_{message_id}.bin")
+        original_file_name = self._extract_file_name(message) or f"message_{message_id}.bin"
+        file_name = storage_safe_filename(original_file_name)
         download_only = progress_extra is not None and progress_extra.get("download_only") is True
+        prepare_video_locally = self.settings.should_prepare_video_locally(download_only=download_only)
         if download_only and progress_extra and progress_extra.get("job_id"):
             job_dir = self.settings.temp_dir / str(progress_extra["job_id"])
             job_dir.mkdir(parents=True, exist_ok=True)
@@ -466,7 +469,7 @@ class TelegramPipeWorker:
         else:
             temp_file = self.settings.temp_dir / file_name
         optimized_temp_file = temp_file.with_name(f"{temp_file.stem}.delivery.mp4")
-        metadata = extract_metadata(file_name)
+        metadata = extract_metadata(original_file_name)
         metadata.update(
             {
                 "telegram_chat_id": chat_id,
@@ -478,6 +481,14 @@ class TelegramPipeWorker:
                 "telegram_mime_type": getattr(message.file, "mime_type", None),
             }
         )
+        if not download_only and self.settings.worker_handles_video_prep:
+            metadata.update(
+                {
+                    "video_prep_applied": False,
+                    "video_prep_delegated_to_worker": True,
+                    "video_prep_mode": "worker",
+                }
+            )
 
         self._track_temp_path(temp_file)
         self._track_temp_path(optimized_temp_file)
@@ -521,7 +532,7 @@ class TelegramPipeWorker:
 
             prep_result = None
             prep_analysis = None
-            if self.settings.video_prep_enabled:
+            if prepare_video_locally:
                 await self._invoke_progress(
                     progress_callback,
                     "preparing",
@@ -695,9 +706,28 @@ class TelegramPipeWorker:
                 )
                 LOGGER.info("Download only: %s ready at %s", delivery_file.name, delivery_file)
             else:
-                await self._invoke_progress(progress_callback, "uploading", {"file_name": delivery_file.name})
-                LOGGER.info("Uploading %s to CDN", delivery_file.name)
-                cdn_response = await self.cdn.upload_file(delivery_file, metadata)
+                handoff_source_url = None
+                upload_message = "Uploading to CDN…"
+
+                if self.settings.cdn_handoff_mode == "source_url":
+                    handoff_source_url = build_signed_temp_url(self.settings, delivery_file)
+                    metadata["telebot_source_url"] = handoff_source_url
+                    upload_message = "Passing temp file URL to Laravel worker…"
+                elif self.settings.worker_handles_video_prep:
+                    upload_message = "Handing original file to Laravel worker…"
+
+                await self._invoke_progress(
+                    progress_callback,
+                    "uploading",
+                    {"file_name": delivery_file.name, "message": upload_message},
+                )
+                if self.settings.cdn_handoff_mode == "source_url":
+                    LOGGER.info("Handing off signed temp URL %s to Laravel worker", handoff_source_url)
+                elif self.settings.worker_handles_video_prep:
+                    LOGGER.info("Handing off original file %s to Laravel worker", delivery_file.name)
+                else:
+                    LOGGER.info("Uploading %s to CDN", delivery_file.name)
+                cdn_response = await self.cdn.upload_file(delivery_file, metadata, source_url=handoff_source_url)
                 cdn_payload = cdn_response.get("data", cdn_response) if isinstance(cdn_response, dict) else cdn_response
                 await self.store.mark_processed(
                     chat_id,
@@ -714,10 +744,21 @@ class TelegramPipeWorker:
                     }
                 )
                 upload_complete = True
+                if self.settings.cdn_handoff_mode == "source_url":
+                    keep_temp_files = True
                 await self._invoke_progress(
                     progress_callback,
                     "done",
-                    {"cdn_response": cdn_payload, "metadata": metadata, "file_name": delivery_file.name},
+                    {
+                        "cdn_response": cdn_payload,
+                        "metadata": metadata,
+                        "file_name": delivery_file.name,
+                        "message": (
+                            "Done. Worker accepted the temp URL and telebot will keep the file until cleanup removes it."
+                            if self.settings.cdn_handoff_mode == "source_url"
+                            else "Done. File deleted."
+                        ),
+                    },
                 )
                 LOGGER.info("Finished %s", delivery_file.name)
         except JobCancelledError:

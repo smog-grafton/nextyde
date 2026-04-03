@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -19,11 +20,13 @@ from pydantic import BaseModel
 from app.config import Settings
 from app.link_parser import parse_telegram_link
 from app.media_tools import detect_media_tools
+from app.temp_url import resolve_signed_temp_path
 from app.telegram_worker import AlreadyProcessedError, JobCancelledError, TelegramPipeWorker
 
 LOG = logging.getLogger("telebot.web")
 jobs: dict[str, dict] = {}
 worker: TelegramPipeWorker | None = None
+app_settings: Settings | None = None
 authorized = False
 
 TERMINAL_STATUSES = {"done", "failed", "cancelled", "destroyed", "expired"}
@@ -202,24 +205,31 @@ def _job_message(error: Exception) -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global worker, authorized
+    global worker, authorized, app_settings
     try:
         settings = Settings.load()
-        worker = TelegramPipeWorker(settings)
-        await worker.store.init()
-        worker.bind_job_registry(jobs)
-        worker.settings.temp_dir.mkdir(parents=True, exist_ok=True)
-        await worker.client.connect()
-        authorized = await worker.client.is_user_authorized()
-        if not authorized:
-            LOG.warning("Telegram not authorized. Run 'python main.py' once to log in.")
+        app_settings = settings
+        if os.getenv("WEB_DISABLE_TELEGRAM", "").strip().lower() in {"1", "true", "yes", "on"}:
+            settings.temp_dir.mkdir(parents=True, exist_ok=True)
+            worker = None
+            authorized = False
+            LOG.info("Web app running in temp-file-only mode. Telegram processing endpoints stay disabled.")
         else:
-            me = await worker.client.get_me()
-            LOG.info("Web app ready. Signed in as %s", getattr(me, "username", me.id))
-        recovered = _recover_download_only_jobs(worker)
-        if recovered:
-            LOG.info("Recovered %s download-only job(s) from temp storage", recovered)
-        await worker.start_housekeeping(jobs)
+            worker = TelegramPipeWorker(settings)
+            await worker.store.init()
+            worker.bind_job_registry(jobs)
+            worker.settings.temp_dir.mkdir(parents=True, exist_ok=True)
+            await worker.client.connect()
+            authorized = await worker.client.is_user_authorized()
+            if not authorized:
+                LOG.warning("Telegram not authorized. Run 'python main.py' once to log in.")
+            else:
+                me = await worker.client.get_me()
+                LOG.info("Web app ready. Signed in as %s", getattr(me, "username", me.id))
+            recovered = _recover_download_only_jobs(worker)
+            if recovered:
+                LOG.info("Recovered %s download-only job(s) from temp storage", recovered)
+            await worker.start_housekeeping(jobs)
     except Exception as exc:
         LOG.exception("Startup failed: %s", exc)
         authorized = False
@@ -352,6 +362,25 @@ async def api_temp_file_legacy(job_id: str):
     )
 
 
+@app.get("/api/fetch/{token}/{filename}")
+async def api_fetch_file(token: str, filename: str):
+    settings = app_settings if app_settings is not None else (worker.settings if worker is not None else None)
+    if settings is None:
+        raise HTTPException(503, detail="Temp file server is not ready.")
+
+    try:
+        path = resolve_signed_temp_path(settings, token, filename)
+    except ValueError as exc:
+        raise HTTPException(404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(500, detail=str(exc)) from exc
+
+    if not path.is_file():
+        raise HTTPException(404, detail="File not found or already expired.")
+
+    return FileResponse(path, filename=path.name, media_type="application/octet-stream")
+
+
 @app.post("/api/destroy/{job_id}")
 async def api_destroy(job_id: str):
     _prune_recent_jobs(worker)
@@ -402,7 +431,7 @@ async def api_jobs(limit: int = 30):
 async def api_health():
     tools = detect_media_tools()
     return {
-        "telegram": "connected" if authorized else "not_logged_in",
+        "telegram": "connected" if authorized else ("disabled" if worker is None and app_settings is not None else "not_logged_in"),
         "worker": worker is not None,
         "active_jobs": _active_job_count(),
         "ffmpeg_available": tools.ffmpeg.available,
