@@ -1,5 +1,6 @@
 """
-Simple web UI: paste one or more t.me links, then run download -> prepare -> CDN or expose temp URL.
+Simple web UI: paste one or more t.me links, then run download -> worker/CDN handoff
+or expose a temp URL for manual fetching.
 Requires a valid Telethon session (run `python main.py` once to log in).
 """
 from __future__ import annotations
@@ -61,17 +62,25 @@ def _prune_recent_jobs(current_worker: TelegramPipeWorker | None, now: float | N
     return len(removable_ids)
 
 
-def _build_temp_url(current_worker: TelegramPipeWorker | None, job: dict) -> str | None:
-    if not current_worker:
-        return None
+def _build_temp_path(job: dict) -> str | None:
     temp_path = job.get("temp_path")
+    job_id = str(job.get("job_id", "")).strip()
+    if not temp_path or not job_id:
+        return None
+    file_name = Path(temp_path).name
+    return f"/api/temp/{quote(job_id, safe='')}/{quote(file_name, safe='')}"
+
+
+def _build_temp_url(current_worker: TelegramPipeWorker | None, job: dict) -> str | None:
+    temp_path = _build_temp_path(job)
     if not temp_path:
         return None
+    if not current_worker:
+        return temp_path
     base = (current_worker.settings.temp_public_url or "").strip()
     if not base:
-        return None
-    file_name = job.get("file_name") or Path(temp_path).name
-    return f"{base.rstrip('/')}/api/temp/{quote(str(job.get('job_id', '')), safe='')}/{quote(file_name, safe='')}"
+        return temp_path
+    return f"{base.rstrip('/')}{temp_path}"
 
 
 def _job_with_temp_url(job: dict, current_worker: TelegramPipeWorker | None) -> dict:
@@ -106,7 +115,7 @@ def _recover_download_only_jobs(current_worker: TelegramPipeWorker) -> int:
             "job_id": job_id,
             "status": "downloaded",
             "progress_pct": 100,
-            "message": "Recovered after restart. Ready for CDN fetch or destroy.",
+            "message": "Recovered after restart. Temp URL ready to copy or destroy.",
             "file_name": latest.name,
             "link": "",
             "link_key": "",
@@ -345,8 +354,8 @@ def _resolve_temp_file(job_id: str) -> tuple[dict, Path]:
 
 @app.get("/api/temp/{job_id}/{filename}")
 async def api_temp_file(job_id: str, filename: str):
-    job, path = _resolve_temp_file(job_id)
-    expected_name = job.get("file_name") or path.name
+    _, path = _resolve_temp_file(job_id)
+    expected_name = path.name
     if filename != expected_name:
         raise HTTPException(404, detail="File not available for this URL")
     return FileResponse(path, filename=expected_name, media_type="application/octet-stream")
@@ -354,8 +363,8 @@ async def api_temp_file(job_id: str, filename: str):
 
 @app.get("/api/temp/{job_id}/file")
 async def api_temp_file_legacy(job_id: str):
-    job, path = _resolve_temp_file(job_id)
-    expected_name = job.get("file_name") or path.name
+    _, path = _resolve_temp_file(job_id)
+    expected_name = path.name
     return RedirectResponse(
         url=f"/api/temp/{quote(job_id, safe='')}/{quote(expected_name, safe='')}",
         status_code=307,
@@ -756,6 +765,13 @@ def _html() -> str:
       font-size: 0.85rem;
       overflow-wrap: anywhere;
     }
+    .temp-url a {
+      color: var(--accent-strong);
+      text-decoration: none;
+    }
+    .temp-url a:hover {
+      text-decoration: underline;
+    }
     .job-actions {
       display: flex;
       flex-wrap: wrap;
@@ -772,7 +788,7 @@ def _html() -> str:
       <div class="hero-card">
         <div class="eyebrow">Telegram intake dashboard</div>
         <h1>Queue up to 3 movie links and keep every job under control.</h1>
-        <p class="hero-copy">Each job still follows the same safe flow: Telegram download, video preparation, then either CDN upload or a real temporary file URL with the final extension already in place.</p>
+        <p class="hero-copy">Each job follows a simple flow: Telegram download, then either worker/CDN handoff or a temporary fetch URL with the original extension and a clean filename.</p>
         <div class="server-status" id="serverStatus"></div>
       </div>
     </section>
@@ -780,14 +796,14 @@ def _html() -> str:
     <div class="layout">
       <section class="panel">
         <h2>Start jobs</h2>
-        <p>Paste 1 to 3 Telegram message links, one per line. Duplicate links are reused instead of spawning another heavy download or transcode.</p>
+        <p>Paste 1 to 3 Telegram message links, one per line. Duplicate links are reused instead of spawning another heavy download or worker handoff.</p>
         <form id="form">
           <label for="linksInput"><strong>Telegram message links</strong></label>
           <textarea id="linksInput" name="links" placeholder="https://t.me/channelname/123&#10;https://t.me/channelname/124&#10;https://t.me/c/1234567890/45" required></textarea>
           <div class="hint">The app trims blank lines and only accepts up to 3 links at a time.</div>
           <label class="checkbox-row">
             <input type="checkbox" id="downloadOnly" name="download_only">
-            <span>Download only. The job will prepare the file, expose the final URL, then wait for you to click Destroy after your CDN fetches it.</span>
+            <span>Download only. Fetch the Telegram file, expose a temporary URL in this UI, then wait for Destroy after your other tool finishes fetching it.</span>
           </label>
           <button class="btn-primary" type="submit" id="submitBtn">Queue jobs</button>
         </form>
@@ -874,23 +890,33 @@ def _html() -> str:
       return div.innerHTML;
     }
 
+    function toAbsoluteUrl(value) {
+      if (!value) return '';
+      try {
+        return new URL(value, window.location.origin).toString();
+      } catch (_) {
+        return String(value);
+      }
+    }
+
     function renderJob(job) {
       const label = job.file_name || job.link || job.message || job.job_id.slice(0, 8);
       const pct = Math.max(0, Math.min(100, Number(job.progress_pct || 0)));
+      const resolvedTempUrl = job.temp_url ? toAbsoluteUrl(job.temp_url) : '';
       let actions = '';
       if (CANCELLABLE_STATUSES.has(job.status)) {
         actions += '<button type="button" class="btn-danger" data-action="cancel" data-job-id="' + escapeHtml(job.job_id) + '">Cancel</button>';
       }
-      if (job.temp_url && job.temp_path && job.status !== 'destroyed' && job.status !== 'expired') {
-        actions += '<button type="button" class="btn-secondary" data-action="copy-temp-url" data-temp-url="' + escapeHtml(job.temp_url) + '">Copy URL</button>';
+      if (resolvedTempUrl && job.temp_path && job.status !== 'destroyed' && job.status !== 'expired') {
+        actions += '<button type="button" class="btn-secondary" data-action="copy-temp-url" data-temp-url="' + escapeHtml(resolvedTempUrl) + '">Copy URL</button>';
       }
       if (job.temp_path && job.status !== 'destroyed' && job.status !== 'expired') {
         actions += '<button type="button" class="btn-danger" data-action="destroy" data-job-id="' + escapeHtml(job.job_id) + '">Destroy</button>';
       }
 
-      let tempUrl = '';
-      if (job.temp_url && job.temp_path) {
-        tempUrl = '<div class="temp-url"><strong>Temp URL</strong><br>' + escapeHtml(job.temp_url) + '</div>';
+      let tempUrlPanel = '';
+      if (resolvedTempUrl && job.temp_path) {
+        tempUrlPanel = '<div class="temp-url"><strong>Temp URL</strong><br><a href="' + escapeHtml(resolvedTempUrl) + '" target="_blank" rel="noreferrer">' + escapeHtml(resolvedTempUrl) + '</a></div>';
       }
 
       const progress = TERMINAL_STATUSES.has(job.status) && job.status !== 'downloaded'
@@ -914,7 +940,7 @@ def _html() -> str:
         +   '<div class="job-message">' + escapeHtml(job.message || job.status) + '</div>'
         +   progress
         +   (meta.length ? '<div class="meta-row">' + meta.map((item) => '<span>' + escapeHtml(item) + '</span>').join('') + '</div>' : '')
-        +   tempUrl
+        +   tempUrlPanel
         +   (actions ? '<div class="job-actions">' + actions + '</div>' : '')
         + '</article>';
     }

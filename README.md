@@ -125,7 +125,7 @@ FFPROBE_BINARY=
 
 ### Video preparation behavior
 
-When `WORKER_HANDLES_VIDEO_PREP=true`, telebot skips local transcoding/compression for normal worker handoffs and sends the original download to Laravel instead. The local video prep settings below only apply when you disable that delegation or when you use **Download only** mode.
+When `WORKER_HANDLES_VIDEO_PREP=true`, telebot skips local transcoding/compression for normal worker handoffs and sends the original download to Laravel instead. The local video prep settings below only apply when you disable that delegation for normal upload/handoff jobs.
 
 If local video prep is active, telebot:
 
@@ -248,7 +248,7 @@ python -m app.web
 
 3. Open **http://127.0.0.1:8765** in your browser. Paste up to 3 message links (one per line), then queue the jobs. The dashboard shows active jobs and recent jobs separately, so refresh-safe actions like **Copy URL** and **Destroy** still work after the page reloads. Terminal jobs are pruned from recent history automatically after `WEB_RECENT_JOB_RETENTION_HOURS`.
 
-**Download only:** Check **Download only (get link -> paste in CDN -> Destroy)** to skip the worker/CDN handoff. Telebot exposes the downloaded file at a temporary URL; if local video prep is still enabled, it will optimize the file first, otherwise it exposes the original download as-is. The exposed URL always keeps the real file extension and normalizes the filename so there are no spaces in the URL path. Copy that URL, paste it into your CDN’s “import from URL” (source URL), and after the CDN has fetched it, click **Destroy** to delete the temp file. Set `TEMP_PUBLIC_URL` to your telebot’s public URL (e.g. `https://teletyde.example.com`) so the link is reachable by the CDN. Forgotten download-only files are also cleaned up automatically after `TEMP_FILE_TTL_HOURS`.
+**Download only:** Check **Download only** to skip the worker/CDN handoff completely. Telebot now exposes the original downloaded file at a temporary URL without local prep/transcoding, so the URL keeps the real file extension and uses a normalized filename with no spaces in the path. The dashboard shows that URL directly and lets you copy it. Paste it into any tool that can fetch from URL, then click **Destroy** after the fetch is finished. If `TEMP_PUBLIC_URL` is set, telebot uses it; otherwise the web UI falls back to the current browser origin when building the visible temp URL. Forgotten download-only files are also cleaned up automatically after `TEMP_FILE_TTL_HOURS`.
 
 **Automatic remote-worker handoff:** Set `CDN_HANDOFF_MODE=source_url` when telebot and the Laravel worker do not share a filesystem. Telebot will generate a signed temp file URL like `https://telebot.example.com/api/fetch/.../movie-final-cut.mkv` and pass it to the Laravel worker automatically as `source_url`, so there is nothing to copy by hand.
 

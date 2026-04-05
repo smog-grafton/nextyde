@@ -408,7 +408,10 @@ class TelegramPipeWorker:
                     job["progress_pct"] = 100
                     job["result"] = data.get("cdn_response")
                 elif status == "downloaded":
-                    job["message"] = "Ready. Copy the link, paste in CDN import, then click Destroy."
+                    job["message"] = data.get(
+                        "message",
+                        "Ready. Copy the temp URL, then destroy it after the other tool finishes fetching.",
+                    )
                     job["progress_pct"] = 100
                     job["temp_path"] = data.get("temp_path", "")
                 elif status == "cancelled":
@@ -702,7 +705,12 @@ class TelegramPipeWorker:
                 await self._invoke_progress(
                     progress_callback,
                     "downloaded",
-                    {"temp_path": str(delivery_file), "file_name": delivery_file.name, "metadata": metadata},
+                    {
+                        "temp_path": str(delivery_file),
+                        "file_name": delivery_file.name,
+                        "metadata": metadata,
+                        "message": "Ready. Copy the temp URL, then destroy it after the other tool finishes fetching.",
+                    },
                 )
                 LOGGER.info("Download only: %s ready at %s", delivery_file.name, delivery_file)
             else:

@@ -89,10 +89,10 @@ class Settings:
     web_recent_job_retention_hours: int
 
     def should_prepare_video_locally(self, *, download_only: bool = False) -> bool:
+        if download_only:
+            return False
         if not self.video_prep_enabled:
             return False
-        if download_only:
-            return True
         return not self.worker_handles_video_prep
 
     @classmethod

@@ -184,7 +184,7 @@ class WebBehaviorTests(unittest.IsolatedAsyncioTestCase):
             "status": "downloaded",
             "progress_pct": 100,
             "message": "Ready",
-            "file_name": "movie.delivery.mp4",
+            "file_name": "Movie Delivery.mp4",
             "link": "https://t.me/demo/1",
             "link_key": "demo:1",
             "result": None,
@@ -200,6 +200,30 @@ class WebBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         response = await web.api_temp_file_legacy("job-1")
         self.assertEqual(response.headers["location"], "/api/temp/job-1/movie.delivery.mp4")
+
+    async def test_temp_url_falls_back_to_relative_path_without_public_base(self) -> None:
+        file_path = self.temp_dir / "job-2" / "movie-final-cut.mkv"
+        file_path.parent.mkdir(parents=True, exist_ok=True)
+        file_path.write_bytes(b"video")
+        web.worker.settings.temp_public_url = ""
+        web.jobs["job-2"] = {
+            "job_id": "job-2",
+            "status": "downloaded",
+            "progress_pct": 100,
+            "message": "Ready",
+            "file_name": "movie-final-cut.mkv",
+            "link": "https://t.me/demo/2",
+            "link_key": "demo:2",
+            "result": None,
+            "error": None,
+            "temp_path": str(file_path),
+            "download_only": True,
+            "_ts": 2.0,
+            "updated_ts": 2.0,
+        }
+
+        temp_url = web._build_temp_url(web.worker, web.jobs["job-2"])
+        self.assertEqual(temp_url, "/api/temp/job-2/movie-final-cut.mkv")
 
     async def test_signed_fetch_url_resolves_real_file(self) -> None:
         file_path = self.temp_dir / "watcher" / "movie-final-cut.mkv"
@@ -254,12 +278,12 @@ class VideoPrepAnalysisTests(unittest.TestCase):
     def test_storage_safe_filename_removes_spaces_but_keeps_extension(self) -> None:
         self.assertEqual(storage_safe_filename("My Movie Final Cut.mkv"), "My-Movie-Final-Cut.mkv")
 
-    def test_worker_handoff_skips_local_prep_for_normal_jobs(self) -> None:
+    def test_download_only_always_skips_local_prep(self) -> None:
         settings = make_settings(Path("/tmp/telebot-tests"))
         settings.worker_handles_video_prep = True
 
         self.assertFalse(settings.should_prepare_video_locally())
-        self.assertTrue(settings.should_prepare_video_locally(download_only=True))
+        self.assertFalse(settings.should_prepare_video_locally(download_only=True))
 
     def test_analyze_video_for_delivery_builds_capped_attempts(self) -> None:
         source_probe = MediaProbeResult(
@@ -286,6 +310,62 @@ class VideoPrepAnalysisTests(unittest.TestCase):
 
 
 class TelegramWorkerBehaviorTests(unittest.IsolatedAsyncioTestCase):
+    async def test_download_only_keeps_original_file_without_local_transcode(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            settings = make_settings(Path(temp_dir_name))
+            settings.video_prep_enabled = True
+
+            worker = TelegramPipeWorker(settings)
+            await worker.cdn.close()
+            worker.store = SimpleNamespace(
+                is_processed=AsyncMock(return_value=False),
+                mark_processed=AsyncMock(),
+            )
+            worker.cdn = SimpleNamespace(
+                upload_file=AsyncMock(),
+                notify=AsyncMock(),
+            )
+
+            async def instant_acquire(semaphore, progress_extra=None) -> None:
+                await semaphore.acquire()
+
+            async def fake_download(message, destination, progress_callback=None) -> None:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                destination.write_bytes(b"video")
+                if progress_callback is not None:
+                    progress_callback(1, 1)
+
+            worker._acquire_stage_slot = instant_acquire
+            worker._download_media_to_path = fake_download
+
+            progress_events: list[tuple[str, dict]] = []
+
+            async def record_progress(status: str, data: dict) -> None:
+                progress_events.append((status, data))
+
+            message = SimpleNamespace(
+                id=456,
+                file=SimpleNamespace(name="movie final cut.mkv", size=1024, mime_type="video/x-matroska"),
+                document=SimpleNamespace(attributes=[]),
+                date=datetime.now(timezone.utc),
+                get_chat=AsyncMock(return_value=SimpleNamespace(id=789, title="Demo Channel")),
+            )
+
+            with patch("app.telegram_worker.analyze_video_for_delivery", side_effect=AssertionError("analyze should not run")):
+                with patch("app.telegram_worker.prepare_video_for_delivery", side_effect=AssertionError("prepare should not run")):
+                    await worker._handle_message(
+                        message,
+                        catch_up=False,
+                        progress_callback=record_progress,
+                        progress_extra={"download_only": True, "job_id": "job-123"},
+                    )
+
+            downloaded = [data for status, data in progress_events if status == "downloaded"][-1]
+            self.assertEqual(Path(downloaded["temp_path"]).name, "movie-final-cut.mkv")
+            self.assertTrue(Path(downloaded["temp_path"]).is_file())
+            worker.cdn.upload_file.assert_not_called()
+            worker.store.mark_processed.assert_not_called()
+
     async def test_worker_handoff_uses_original_file_without_local_transcode(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir_name:
             settings = make_settings(Path(temp_dir_name))
