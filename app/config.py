@@ -59,6 +59,7 @@ class Settings:
     delete_after_upload: bool
     poll_interval_seconds: int
     cdn_upload_url: str
+    cdn_stream_upload_url: str
     cdn_api_token: str | None
     cdn_timeout_seconds: int
     cdn_source: str
@@ -87,6 +88,7 @@ class Settings:
     video_prep_timeout_seconds: int
     temp_file_ttl_hours: int
     web_recent_job_retention_hours: int
+    worker_api_token: str | None
 
     def should_prepare_video_locally(self, *, download_only: bool = False) -> bool:
         if download_only:
@@ -145,6 +147,7 @@ class Settings:
             delete_after_upload=_bool("DELETE_AFTER_UPLOAD", True),
             poll_interval_seconds=max(10, int(os.getenv("POLL_INTERVAL_SECONDS", "30"))),
             cdn_upload_url=cdn_upload_url,
+            cdn_stream_upload_url=os.getenv("CDN_STREAM_UPLOAD_URL", "").strip() or cdn_upload_url,
             cdn_api_token=os.getenv("CDN_API_TOKEN") or None,
             cdn_timeout_seconds=max(60, int(os.getenv("CDN_TIMEOUT_SECONDS", "3600"))),
             cdn_source=os.getenv("CDN_SOURCE", "telegram").strip() or "telegram",
@@ -159,7 +162,7 @@ class Settings:
             worker_intake_disk=(os.getenv("CDN_SHARED_INTAKE_DISK", "telegram-intake").strip() or "telegram-intake"),
             worker_handles_video_prep=_bool(
                 "WORKER_HANDLES_VIDEO_PREP",
-                handoff_mode in {"path_copy", "source_url"},
+                handoff_mode in {"path_copy", "source_url", "stream"},
             ),
             default_category=os.getenv("DEFAULT_CATEGORY") or None,
             default_language=os.getenv("DEFAULT_LANGUAGE") or None,
@@ -180,4 +183,5 @@ class Settings:
             video_prep_timeout_seconds=max(60, int(os.getenv("VIDEO_PREP_TIMEOUT_SECONDS", "21600"))),
             temp_file_ttl_hours=max(1, int(os.getenv("TEMP_FILE_TTL_HOURS", "24"))),
             web_recent_job_retention_hours=max(1, int(os.getenv("WEB_RECENT_JOB_RETENTION_HOURS", "24"))),
+            worker_api_token=(os.getenv("WORKER_API_TOKEN") or "").strip() or None,
         )

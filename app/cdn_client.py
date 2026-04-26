@@ -5,7 +5,7 @@ import logging
 import shutil
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 from uuid import uuid4
 
 import httpx
@@ -68,6 +68,38 @@ class CdnClient:
                 else:
                     LOGGER.exception("CDN upload failed after %s attempts", CDN_UPLOAD_MAX_ATTEMPTS)
         raise last_error  # type: ignore[misc]
+
+    async def stream_file(
+        self,
+        chunks: AsyncIterator[bytes],
+        metadata: dict[str, Any],
+        *,
+        original_filename: str,
+        bytes_total: int | None = None,
+    ) -> dict[str, Any]:
+        headers = self._headers()
+        headers["Content-Type"] = "application/octet-stream"
+        data = self._intake_payload(metadata, original_filename=original_filename)
+        asset_id = str(metadata.get("cdn_asset_id") or "").strip()
+        source_id = str(metadata.get("cdn_source_id") or "").strip()
+        if asset_id:
+            data["asset_id"] = asset_id
+        if source_id:
+            data["source_id"] = source_id
+        if bytes_total and bytes_total > 0:
+            data["bytes_total"] = str(bytes_total)
+
+        response = await self._client.post(
+            self.settings.cdn_stream_upload_url,
+            headers=headers,
+            params=data,
+            content=chunks,
+        )
+        response.raise_for_status()
+        content_type = response.headers.get("content-type", "")
+        if "application/json" in content_type:
+            return response.json()
+        return {"status": "ok", "raw": response.text}
 
     async def _handoff_by_path(self, file_path: Path, metadata: dict[str, Any]) -> dict[str, Any]:
         if self.settings.worker_intake_root is None:

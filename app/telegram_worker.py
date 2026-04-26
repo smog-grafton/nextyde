@@ -4,7 +4,7 @@ import asyncio
 import logging
 import time
 from pathlib import Path
-from typing import Any, Callable, Awaitable
+from typing import Any, AsyncIterator, Callable, Awaitable
 
 ProgressCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
 
@@ -363,6 +363,7 @@ class TelegramPipeWorker:
         link: str,
         progress_callback: ProgressCallback | None = None,
         job: dict[str, Any] | None = None,
+        intake_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Fetch a t.me message by URL, process it (download → CDN → notify), return result or raise.
         If job dict is provided, it is updated with status, progress_pct, message, and result/error."""
@@ -435,6 +436,7 @@ class TelegramPipeWorker:
                 catch_up=False,
                 progress_callback=cb,
                 progress_extra=progress_extra,
+                intake_metadata=intake_metadata,
             )
         except AlreadyProcessedError:
             raise
@@ -450,6 +452,7 @@ class TelegramPipeWorker:
         catch_up: bool,
         progress_callback: ProgressCallback | None = None,
         progress_extra: dict[str, Any] | None = None,
+        intake_metadata: dict[str, Any] | None = None,
     ) -> None:
         chat = await message.get_chat()
         chat_id = getattr(chat, "id", 0)
@@ -484,6 +487,8 @@ class TelegramPipeWorker:
                 "telegram_mime_type": getattr(message.file, "mime_type", None),
             }
         )
+        if intake_metadata:
+            metadata.update(intake_metadata)
         if not download_only and self.settings.worker_handles_video_prep:
             metadata.update(
                 {
@@ -492,6 +497,18 @@ class TelegramPipeWorker:
                     "video_prep_mode": "worker",
                 }
             )
+
+        if not download_only and self.settings.cdn_handoff_mode == "stream":
+            await self._stream_message_to_cdn(
+                message=message,
+                chat_id=chat_id,
+                message_id=message_id,
+                file_name=file_name,
+                metadata=metadata,
+                progress_callback=progress_callback,
+                progress_extra=progress_extra,
+            )
+            return
 
         self._track_temp_path(temp_file)
         self._track_temp_path(optimized_temp_file)
@@ -810,3 +827,100 @@ class TelegramPipeWorker:
                 await out
         except Exception:  # noqa: BLE001
             pass
+
+    async def _stream_message_to_cdn(
+        self,
+        *,
+        message: Any,
+        chat_id: int,
+        message_id: int,
+        file_name: str,
+        metadata: dict[str, Any],
+        progress_callback: ProgressCallback | None = None,
+        progress_extra: dict[str, Any] | None = None,
+    ) -> None:
+        file_size = int(getattr(message.file, "size", 0) or 0)
+        dc_id, input_location = telethon_utils.get_input_location(message.media or message)
+        bytes_sent = 0
+
+        await self._invoke_progress(
+            progress_callback,
+            "downloading",
+            {
+                "file_name": file_name,
+                "progress_pct": 0,
+                "message": "Streaming Telegram file to CDN...",
+            },
+        )
+
+        async def chunks() -> AsyncIterator[bytes]:
+            nonlocal bytes_sent
+
+            async for chunk in self.client.iter_download(
+                input_location,
+                request_size=self.settings.download_chunk_size,
+                file_size=file_size or None,
+                dc_id=dc_id,
+            ):
+                if progress_extra is not None and progress_extra.get("cancelled"):
+                    raise JobCancelledError("Job cancelled")
+                if not chunk:
+                    continue
+
+                chunk_bytes = bytes(chunk)
+                bytes_sent += len(chunk_bytes)
+
+                if file_size:
+                    progress_pct = min(98, int(bytes_sent * 100 / file_size))
+                    if progress_extra is not None:
+                        progress_extra["progress_pct"] = progress_pct
+                        progress_extra["file_name"] = file_name
+                    await self._invoke_progress(
+                        progress_callback,
+                        "downloading",
+                        {
+                            "file_name": file_name,
+                            "progress_pct": progress_pct,
+                            "message": "Streaming Telegram file to CDN...",
+                        },
+                    )
+
+                yield chunk_bytes
+
+        LOGGER.info("Streaming %s from Telegram message %s directly to CDN", file_name, message_id)
+        await self._acquire_stage_slot(self._download_sem, progress_extra)
+        try:
+            cdn_response = await self.cdn.stream_file(
+                chunks(),
+                metadata,
+                original_filename=file_name,
+                bytes_total=file_size or None,
+            )
+        finally:
+            self._download_sem.release()
+
+        cdn_payload = cdn_response.get("data", cdn_response) if isinstance(cdn_response, dict) else cdn_response
+        await self.store.mark_processed(
+            chat_id,
+            message_id,
+            file_name,
+            "uploaded",
+            orjson.dumps(cdn_response).decode("utf-8"),
+        )
+        await self.cdn.notify(
+            {
+                "status": "uploaded",
+                "telegram": metadata,
+                "cdn_response": cdn_payload,
+            }
+        )
+        await self._invoke_progress(
+            progress_callback,
+            "done",
+            {
+                "cdn_response": cdn_payload,
+                "metadata": metadata,
+                "file_name": file_name,
+                "message": "Done. Streamed to CDN and optimization has started.",
+            },
+        )

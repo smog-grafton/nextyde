@@ -14,7 +14,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
@@ -172,7 +172,23 @@ def _find_active_job_by_key(link_key: str) -> dict | None:
     return None
 
 
-def _build_job(link: str, link_key: str, download_only: bool) -> dict:
+def _find_active_job(link_key: str, metadata: dict | None = None) -> dict | None:
+    target_source_id = str((metadata or {}).get("cdn_source_id") or "").strip()
+
+    for job in jobs.values():
+        if job.get("link_key") != link_key or _is_terminal_status(job.get("status")):
+            continue
+
+        job_source_id = str((job.get("source_metadata") or {}).get("cdn_source_id") or "").strip()
+        if target_source_id and job_source_id and target_source_id != job_source_id:
+            continue
+
+        return job
+
+    return None
+
+
+def _build_job(link: str, link_key: str, download_only: bool, metadata: dict | None = None) -> dict:
     now = time.time()
     return {
         "job_id": str(uuid.uuid4()),
@@ -186,6 +202,7 @@ def _build_job(link: str, link_key: str, download_only: bool) -> dict:
         "error": None,
         "temp_path": None,
         "download_only": download_only,
+        "source_metadata": metadata or {},
         "_ts": now,
         "updated_ts": now,
     }
@@ -210,6 +227,18 @@ def _job_message(error: Exception) -> str:
     if "readerror" in text or "read error" in text:
         return "Upload to CDN failed (connection closed). Try again."
     return str(error)
+
+
+def _require_worker_token(authorization: str | None) -> None:
+    settings = worker.settings if worker is not None else app_settings
+    token = settings.worker_api_token if settings is not None else None
+
+    if not token:
+        return
+
+    expected = f"Bearer {token}"
+    if authorization != expected:
+        raise HTTPException(401, detail="Invalid worker API token.")
 
 
 @asynccontextmanager
@@ -254,6 +283,7 @@ class ProcessRequest(BaseModel):
     link: str | None = None
     links: list[str] | None = None
     download_only: bool = False
+    metadata: dict | None = None
 
 
 @app.post("/api/process")
@@ -271,11 +301,11 @@ async def api_process(req: ProcessRequest):
     existing_jobs: list[dict] = []
     new_jobs: list[dict] = []
     for entry in normalized_links:
-        existing = _find_active_job_by_key(entry["link_key"])
+        existing = _find_active_job(entry["link_key"], req.metadata)
         if existing is not None:
             existing_jobs.append(existing)
             continue
-        new_jobs.append(_build_job(entry["link"], entry["link_key"], download_only))
+        new_jobs.append(_build_job(entry["link"], entry["link_key"], download_only, req.metadata))
 
     active_limit = worker.settings.web_max_active_jobs
     if _active_job_count() + len(new_jobs) > active_limit:
@@ -284,7 +314,7 @@ async def api_process(req: ProcessRequest):
     async def run_job(job_id: str) -> None:
         job = jobs[job_id]
         try:
-            await worker.process_link(job["link"], job=job)
+            await worker.process_link(job["link"], job=job, intake_metadata=job.get("source_metadata") or None)
         except AlreadyProcessedError as exc:
             job["status"] = "failed"
             job["error"] = str(exc)
@@ -452,6 +482,40 @@ async def api_health():
         "ffmpeg_error": tools.ffmpeg.error,
         "ffprobe_error": tools.ffprobe.error,
     }
+
+
+@app.get("/api/worker/capacity")
+async def api_worker_capacity(authorization: str | None = Header(default=None)):
+    _require_worker_token(authorization)
+    settings = worker.settings if worker is not None else app_settings
+    if settings is None:
+        raise HTTPException(503, detail="Worker settings are not loaded.")
+
+    active_jobs = _active_job_count()
+    max_active_jobs = settings.web_max_active_jobs
+
+    return {
+        "available": authorized and worker is not None and active_jobs < max_active_jobs,
+        "telegram": "connected" if authorized else ("disabled" if worker is None else "not_logged_in"),
+        "active_jobs": active_jobs,
+        "max_active_jobs": max_active_jobs,
+        "free_slots": max(0, max_active_jobs - active_jobs),
+        "max_concurrent_downloads": settings.max_concurrent_downloads,
+        "handoff_mode": settings.cdn_handoff_mode,
+        "stream_supported": True,
+    }
+
+
+@app.post("/api/worker/jobs")
+async def api_worker_create_job(req: ProcessRequest, authorization: str | None = Header(default=None)):
+    _require_worker_token(authorization)
+    return await api_process(req)
+
+
+@app.get("/api/worker/jobs/{job_id}")
+async def api_worker_job_status(job_id: str, authorization: str | None = Header(default=None)):
+    _require_worker_token(authorization)
+    return await api_status(job_id)
 
 
 @app.get("/health")
