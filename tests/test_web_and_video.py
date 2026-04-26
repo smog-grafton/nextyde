@@ -39,6 +39,7 @@ def make_settings(temp_dir: Path) -> Settings:
         delete_after_upload=True,
         poll_interval_seconds=30,
         cdn_upload_url="https://cdn.example.com/upload",
+        cdn_stream_upload_url="https://cdn.example.com/stream-upload",
         cdn_api_token=None,
         cdn_timeout_seconds=3600,
         cdn_source="telegram",
@@ -67,6 +68,7 @@ def make_settings(temp_dir: Path) -> Settings:
         video_prep_timeout_seconds=21600,
         temp_file_ttl_hours=24,
         web_recent_job_retention_hours=24,
+        worker_api_token=None,
     )
 
 
