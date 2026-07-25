@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 *.session
 *.session-journal
+teletyde-prod-env.md
