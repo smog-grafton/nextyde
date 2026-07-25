@@ -56,7 +56,7 @@ VIDEO_PREP_TIMEOUT_SECONDS=21600
 FFMPEG_BINARY=
 FFPROBE_BINARY=
 
-CDN_UPLOAD_URL=https://worker.example.com/api/v1/media/telegram-intake
+CDN_UPLOAD_URL=https://nbx.example.com/api/v1/media/telegram-handoff
 CDN_API_TOKEN=replace_me
 CDN_TIMEOUT_SECONDS=3600
 CDN_SOURCE=telegram

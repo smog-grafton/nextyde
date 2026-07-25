@@ -7,8 +7,8 @@
 If your telebot Coolify resource is already running with the usual Telegram and web variables, the important worker-integration delta is:
 
 ```env
-# Change this away from the old CDN intake if Laravel worker is now the intake target.
-CDN_UPLOAD_URL=https://worker.example.com/api/v1/media/telegram-intake
+# NBX accepts metadata and pulls the signed Teletyde URL itself.
+CDN_UPLOAD_URL=https://nbx.example.com/api/v1/media/telegram-handoff
 
 # Recommended for separate Coolify containers, even on the same host.
 CDN_HANDOFF_MODE=source_url
@@ -28,6 +28,21 @@ Notes:
 - `MAX_CONCURRENT_UPLOADS` is a legacy variable from older deployments and the current telebot code does not read it. You can leave it in Coolify, but it has no effect.
 - If you want `path_copy` instead of `source_url`, both containers must mount the same shared intake volume. Being on the same server is not enough by itself.
 - Keep `VIDEO_PREP_ENABLED=true` if you still want download-only jobs to optimize locally, but normal worker handoffs will skip local prep when `WORKER_HANDLES_VIDEO_PREP=true`.
+
+Example shared-volume layout for `path_copy`:
+
+- Host bind path: `/data/coolify/shared/telegram-intake`
+- Worker mount path: `/var/www/html/storage/app/telegram-intake`
+- Telebot mount path: `/shared/telegram-intake`
+
+Then telebot should use:
+
+```env
+CDN_HANDOFF_MODE=path_copy
+CDN_SHARED_INTAKE_ROOT=/shared/telegram-intake
+CDN_SHARED_INTAKE_DISK=telegram-intake
+WORKER_HANDLES_VIDEO_PREP=true
+```
 
 ## Recommended service split
 
@@ -78,7 +93,7 @@ VIDEO_PREP_TIMEOUT_SECONDS=21600
 FFMPEG_BINARY=
 FFPROBE_BINARY=
 
-CDN_UPLOAD_URL=https://worker.example.com/api/v1/media/telegram-intake
+CDN_UPLOAD_URL=https://nbx.example.com/api/v1/media/telegram-handoff
 CDN_API_TOKEN=replace_me
 CDN_TIMEOUT_SECONDS=3600
 CDN_SOURCE=telegram

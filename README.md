@@ -98,13 +98,11 @@ MAX_CONCURRENT_TRANSCODES=1
 WEB_MAX_ACTIVE_JOBS=3
 WEB_RECENT_JOB_RETENTION_HOURS=24
 SCAN_LAST_MESSAGES=15
-CDN_UPLOAD_URL=https://cdn.naraboxtv.com/api/v1/media/telegram-intake
+CDN_UPLOAD_URL=https://nbx.naraboxtv.com/api/v1/media/telegram-handoff
 CDN_API_TOKEN=replace_me
-CDN_HANDOFF_MODE=path_copy
-CDN_SHARED_INTAKE_ROOT=/Applications/XAMPP/xamppfiles/htdocs/ffmpeg-worker/storage/app/telegram-intake
-CDN_SHARED_INTAKE_DISK=telegram-intake
+CDN_HANDOFF_MODE=source_url
 WORKER_HANDLES_VIDEO_PREP=true
-TEMP_PUBLIC_URL=https://telebot.example.com
+TEMP_PUBLIC_URL=https://teletyde.nara24fm.com
 TEMP_URL_SECRET=replace_me
 CDN_NOTIFY_URL=https://portal.naraboxtv.com/api/telegram/ingest-notify
 CDN_NOTIFY_TOKEN=replace_me
@@ -189,7 +187,7 @@ Add all required env vars in Coolify’s **Environment Variables** for this serv
 | `TG_PHONE` | Yes | +2567xxxxxxxx |
 | `TG_SESSION_NAME` | No (default used) | narabox_telebot |
 | `TG_2FA_PASSWORD` | If 2FA enabled | your password |
-| `CDN_UPLOAD_URL` | Yes | https://cdn.naraboxtv.com/api/v1/media/telegram-intake |
+| `CDN_UPLOAD_URL` | Yes | https://nbx.naraboxtv.com/api/v1/media/telegram-handoff |
 | `CDN_API_TOKEN` | Yes | Same token as portal uses for CDN |
 | `CDN_HANDOFF_MODE` | No | `upload`, `path_copy`, or `source_url` |
 | `CDN_SHARED_INTAKE_ROOT` | If `CDN_HANDOFF_MODE=path_copy` | `/Applications/XAMPP/xamppfiles/htdocs/ffmpeg-worker/storage/app/telegram-intake` |

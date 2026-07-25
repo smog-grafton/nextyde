@@ -518,6 +518,12 @@ async def api_worker_job_status(job_id: str, authorization: str | None = Header(
     return await api_status(job_id)
 
 
+@app.post("/api/worker/jobs/{job_id}/destroy")
+async def api_worker_destroy_job(job_id: str, authorization: str | None = Header(default=None)):
+    _require_worker_token(authorization)
+    return await api_destroy(job_id)
+
+
 @app.get("/health")
 async def root_health():
     return {"status": "ok"}

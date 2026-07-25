@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi import HTTPException
 
 from app import web
+from app.cdn_client import CdnClient
 from app.config import Settings
 from app.filename import storage_safe_filename
 from app.media_probe import AudioStreamInfo, MediaProbeResult, VideoStreamInfo
@@ -70,6 +71,46 @@ def make_settings(temp_dir: Path) -> Settings:
         web_recent_job_retention_hours=24,
         worker_api_token=None,
     )
+
+
+class CdnClientHandoffTests(unittest.IsolatedAsyncioTestCase):
+    async def test_source_url_handoff_uses_small_json_control_request(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            media = temp_dir / "movie.mkv"
+            media.write_bytes(b"video")
+            settings = make_settings(temp_dir)
+            settings.cdn_handoff_mode = "source_url"
+            settings.cdn_upload_url = "https://nbx.example/api/v1/media/telegram-handoff"
+            client = CdnClient(settings)
+            await client.close()
+            response = SimpleNamespace(
+                headers={"content-type": "application/json"},
+                raise_for_status=lambda: None,
+                json=lambda: {"data": {"status": "received"}},
+                text="",
+            )
+            post = AsyncMock(return_value=response)
+            client._client = SimpleNamespace(post=post)
+
+            result = await client.upload_file(
+                media,
+                {
+                    "original_filename": media.name,
+                    "cdn_asset_id": "asset-id",
+                    "cdn_source_id": 108,
+                    "telegram_url": "https://t.me/example/166",
+                },
+                source_url="https://teletyde.example/api/fetch/signed/movie.mkv",
+            )
+
+            self.assertEqual(result["data"]["status"], "received")
+            call = post.await_args
+            self.assertNotIn("files", call.kwargs)
+            self.assertNotIn("content", call.kwargs)
+            self.assertNotIn("params", call.kwargs)
+            self.assertEqual(call.kwargs["json"]["source_id"], 108)
+            self.assertEqual(call.kwargs["json"]["bytes_total"], 5)
 
 
 class DummyWorker:

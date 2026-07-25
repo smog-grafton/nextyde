@@ -736,8 +736,7 @@ class TelegramPipeWorker:
 
                 if self.settings.cdn_handoff_mode == "source_url":
                     handoff_source_url = build_signed_temp_url(self.settings, delivery_file)
-                    metadata["telebot_source_url"] = handoff_source_url
-                    upload_message = "Passing temp file URL to Laravel worker…"
+                    upload_message = "Passing a signed temp file URL to NBX…"
                 elif self.settings.worker_handles_video_prep:
                     upload_message = "Handing original file to Laravel worker…"
 
@@ -747,7 +746,7 @@ class TelegramPipeWorker:
                     {"file_name": delivery_file.name, "message": upload_message},
                 )
                 if self.settings.cdn_handoff_mode == "source_url":
-                    LOGGER.info("Handing off signed temp URL %s to Laravel worker", handoff_source_url)
+                    LOGGER.info("Handing off an authenticated signed temp URL to NBX")
                 elif self.settings.worker_handles_video_prep:
                     LOGGER.info("Handing off original file %s to Laravel worker", delivery_file.name)
                 else:
@@ -779,7 +778,7 @@ class TelegramPipeWorker:
                         "metadata": metadata,
                         "file_name": delivery_file.name,
                         "message": (
-                            "Done. Worker accepted the temp URL and telebot will keep the file until cleanup removes it."
+                            "Done. NBX accepted the temp URL and Teletyde will keep the file until cleanup removes it."
                             if self.settings.cdn_handoff_mode == "source_url"
                             else "Done. File deleted."
                         ),

@@ -141,7 +141,7 @@ class Settings:
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             max_concurrent_downloads=max(1, int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "1"))),
             max_concurrent_transcodes=max(1, int(os.getenv("MAX_CONCURRENT_TRANSCODES", "1"))),
-            web_max_active_jobs=max(1, int(os.getenv("WEB_MAX_ACTIVE_JOBS", "3"))),
+            web_max_active_jobs=max(1, int(os.getenv("WEB_MAX_ACTIVE_JOBS", "2"))),
             scan_last_messages=max(0, int(os.getenv("SCAN_LAST_MESSAGES", "15"))),
             download_chunk_size=max(65536, int(os.getenv("DOWNLOAD_CHUNK_SIZE", str(1024 * 1024)))),
             delete_after_upload=_bool("DELETE_AFTER_UPLOAD", True),

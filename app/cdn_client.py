@@ -80,6 +80,7 @@ class CdnClient:
         headers = self._headers()
         headers["Content-Type"] = "application/octet-stream"
         data = self._intake_payload(metadata, original_filename=original_filename)
+        data.pop("metadata", None)
         asset_id = str(metadata.get("cdn_asset_id") or "").strip()
         source_id = str(metadata.get("cdn_source_id") or "").strip()
         if asset_id:
@@ -140,17 +141,19 @@ class CdnClient:
             raise RuntimeError("A signed temp source URL is required when CDN_HANDOFF_MODE=source_url.")
 
         headers = self._headers()
-        data = self._intake_payload(
-            metadata,
-            original_filename=file_path.name,
-            source_type="telegram",
-            source_url=source_url,
-        )
+        data: dict[str, Any] = {
+            "source_url": source_url,
+            "original_filename": str(metadata.get("original_filename") or file_path.name),
+            "asset_id": str(metadata.get("cdn_asset_id") or ""),
+            "source_id": metadata.get("cdn_source_id"),
+            "bytes_total": file_path.stat().st_size,
+            "metadata": metadata,
+        }
 
         response = await self._client.post(
             self.settings.cdn_upload_url,
             headers=headers,
-            data=data,
+            json=data,
         )
         response.raise_for_status()
         content_type = response.headers.get("content-type", "")
