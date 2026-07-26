@@ -9,6 +9,7 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ffmpeg \
+    openssl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -24,4 +25,6 @@ EXPOSE 8765
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=2 \
     CMD curl -f http://127.0.0.1:8765/health || exit 1
 
+RUN chmod +x /app/docker-entrypoint.sh
+ENTRYPOINT ["/app/docker-entrypoint.sh"]
 CMD ["python", "-m", "app.web"]

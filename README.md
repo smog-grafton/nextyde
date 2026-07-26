@@ -165,6 +165,21 @@ Coolify usually builds from a Git repo. Commit and push the telebot project (add
 
 Set `TG_SESSION_NAME` in Coolify env to the same name you used locally (e.g. `narabox_telebot`) so the app finds the session file.
 
+#### Encrypted session bundled with a public repository
+
+This repository can carry an encrypted `.session.enc` artifact without exposing
+the Telegram login. The container decrypts it before Telebot starts. Configure:
+
+```env
+TG_SESSION_NAME=/data/narabox_telebot
+TELEGRAM_SESSION_KEY=<the private decryption key>
+```
+
+Keep `TELEGRAM_SESSION_KEY` only in Coolify. Do not commit it or add it as a
+Docker build argument. At startup, `/app/deploy/narabox_telebot.session.enc` is
+restored to `/data/narabox_telebot.session` and any stale SQLite journal is
+removed before the application connects.
+
 ### 4. Create the application in Coolify
 
 1. **New Resource** → **Application** (or **Docker Compose** if you prefer).
