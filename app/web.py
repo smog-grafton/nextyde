@@ -22,7 +22,7 @@ from app.config import Settings
 from app.link_parser import parse_telegram_link
 from app.media_tools import detect_media_tools
 from app.temp_url import resolve_signed_temp_path
-from app.telegram_worker import AlreadyProcessedError, JobCancelledError, TelegramPipeWorker
+from app.telegram_worker import JobCancelledError, TelegramPipeWorker
 
 LOG = logging.getLogger("telebot.web")
 jobs: dict[str, dict] = {}
@@ -188,7 +188,7 @@ def _find_active_job(link_key: str, metadata: dict | None = None) -> dict | None
     return None
 
 
-def _build_job(link: str, link_key: str, download_only: bool, metadata: dict | None = None) -> dict:
+def _build_job(link: str, link_key: str, download_only: bool, metadata: dict | None = None, force: bool = False) -> dict:
     now = time.time()
     return {
         "job_id": str(uuid.uuid4()),
@@ -202,6 +202,7 @@ def _build_job(link: str, link_key: str, download_only: bool, metadata: dict | N
         "error": None,
         "temp_path": None,
         "download_only": download_only,
+        "force": force,
         "source_metadata": metadata or {},
         "_ts": now,
         "updated_ts": now,
@@ -284,6 +285,7 @@ class ProcessRequest(BaseModel):
     links: list[str] | None = None
     download_only: bool = False
     metadata: dict | None = None
+    force: bool = False
 
 
 @app.post("/api/process")
@@ -305,7 +307,7 @@ async def api_process(req: ProcessRequest):
         if existing is not None:
             existing_jobs.append(existing)
             continue
-        new_jobs.append(_build_job(entry["link"], entry["link_key"], download_only, req.metadata))
+        new_jobs.append(_build_job(entry["link"], entry["link_key"], download_only, req.metadata, req.force))
 
     active_limit = worker.settings.web_max_active_jobs
     if _active_job_count() + len(new_jobs) > active_limit:
@@ -315,12 +317,6 @@ async def api_process(req: ProcessRequest):
         job = jobs[job_id]
         try:
             await worker.process_link(job["link"], job=job, intake_metadata=job.get("source_metadata") or None)
-        except AlreadyProcessedError as exc:
-            job["status"] = "failed"
-            job["error"] = str(exc)
-            job["message"] = str(exc)
-            _touch_job(job)
-            LOG.info("Job %s skipped (already processed): %s", job_id, exc)
         except JobCancelledError:
             job["status"] = "cancelled"
             job["message"] = "Cancelled."

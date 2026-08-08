@@ -36,6 +36,18 @@ class StateStore:
             await cursor.close()
             return row is not None
 
+    async def get_processed(self, chat_id: int, message_id: int) -> dict | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT chat_id, message_id, file_name, status, cdn_response, created_at, updated_at "
+                "FROM processed_messages WHERE chat_id = ? AND message_id = ? LIMIT 1",
+                (chat_id, message_id),
+            )
+            row = await cursor.fetchone()
+            await cursor.close()
+            return dict(row) if row is not None else None
+
     async def mark_processed(
         self,
         chat_id: int,

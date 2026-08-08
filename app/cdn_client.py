@@ -6,6 +6,7 @@ import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, AsyncIterator
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
@@ -160,6 +161,40 @@ class CdnClient:
         if "application/json" in content_type:
             return response.json()
         return {"status": "ok", "raw": response.text}
+
+    async def get_source_status(self, source_id: str | int) -> dict[str, Any] | None:
+        """Fetch NBX's current status/URLs for a previously-submitted source.
+
+        Used to answer an "already imported" duplicate check with live data
+        instead of the stale acceptance-time snapshot cached at submission
+        (which usually only has status="pending" and no playback URLs yet).
+        Returns None on any lookup failure so callers can fall back to the
+        cached snapshot rather than blowing up the request.
+        """
+        base = self._cdn_base_url()
+        if not base or not str(source_id).strip():
+            return None
+
+        try:
+            response = await self._client.get(
+                f"{base}/api/v1/media/sources/{source_id}",
+                headers=self._headers(),
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except (httpx.HTTPStatusError, httpx.ConnectError, httpx.ReadTimeout, httpx.ReadError) as e:
+            LOGGER.warning("NBX source status lookup failed for source_id=%s: %s", source_id, e)
+            return None
+
+        if isinstance(payload, dict) and payload.get("success") and isinstance(payload.get("data"), dict):
+            return payload["data"]
+        return None
+
+    def _cdn_base_url(self) -> str | None:
+        parsed = urlsplit(self.settings.cdn_upload_url)
+        if not parsed.scheme or not parsed.netloc:
+            return None
+        return f"{parsed.scheme}://{parsed.netloc}"
 
     def _headers(self) -> dict[str, str]:
         headers = {
