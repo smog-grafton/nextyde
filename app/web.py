@@ -203,6 +203,7 @@ def _build_job(link: str, link_key: str, download_only: bool, metadata: dict | N
         "temp_path": None,
         "download_only": download_only,
         "force": force,
+        "duplicate": False,
         "source_metadata": metadata or {},
         "_ts": now,
         "updated_ts": now,
@@ -871,6 +872,10 @@ def _html() -> str:
             <input type="checkbox" id="downloadOnly" name="download_only">
             <span>Download only. Fetch the Telegram file, expose a temporary URL in this UI, then wait for Destroy after your other tool finishes fetching it.</span>
           </label>
+          <label class="checkbox-row">
+            <input type="checkbox" id="forceReimport" name="force">
+            <span>Force re-import, even if these links were already processed before (use this if the original file was lost, e.g. after a redeploy, and needs refetching).</span>
+          </label>
           <button class="btn-primary" type="submit" id="submitBtn">Queue jobs</button>
         </form>
         <div class="notice" id="notice"></div>
@@ -887,7 +892,7 @@ def _html() -> str:
         <div class="panel">
           <div class="section-head">
             <h3>Recent jobs</h3>
-            <span>Refresh-safe actions stay here too, and old finished entries are pruned automatically.</span>
+            <span>Already-imported links show "Force re-import" here — click it to refetch.</span>
           </div>
           <div class="job-grid" id="recentJobs"></div>
         </div>
@@ -978,6 +983,9 @@ def _html() -> str:
       }
       if (job.temp_path && job.status !== 'destroyed' && job.status !== 'expired') {
         actions += '<button type="button" class="btn-danger" data-action="destroy" data-job-id="' + escapeHtml(job.job_id) + '">Destroy</button>';
+      }
+      if (job.duplicate && job.link) {
+        actions += '<button type="button" class="btn-secondary" data-action="force-reimport" data-link="' + escapeHtml(job.link) + '">Force re-import</button>';
       }
 
       let tempUrlPanel = '';
@@ -1073,6 +1081,23 @@ def _html() -> str:
         } catch (error) {
           showNotice(error.message || 'Destroy failed.', 'error');
         }
+        return;
+      }
+
+      if (target.dataset.action === 'force-reimport' && target.dataset.link) {
+        target.disabled = true;
+        try {
+          await apiJson('/api/process', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ link: target.dataset.link, force: true })
+          });
+          showNotice('Force re-import queued.', 'ok');
+          await refreshJobs();
+        } catch (error) {
+          showNotice(error.message || 'Force re-import failed.', 'error');
+          target.disabled = false;
+        }
       }
     });
 
@@ -1090,7 +1115,8 @@ def _html() -> str:
       try {
         const payload = {
           links: links,
-          download_only: document.getElementById('downloadOnly').checked
+          download_only: document.getElementById('downloadOnly').checked,
+          force: document.getElementById('forceReimport').checked
         };
         const data = await apiJson('/api/process', {
           method: 'POST',
