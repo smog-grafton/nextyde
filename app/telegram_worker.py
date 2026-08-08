@@ -37,10 +37,6 @@ class JobCancelledError(Exception):
     """Raised when a job is cancelled via the web UI or API."""
 
 
-class AlreadyProcessedError(Exception):
-    """Raised when the message was already processed (success or failed) and we skip."""
-
-
 TELEGRAM_LINK_PATTERN = TELEGRAM_LINK_RE
 HOUSEKEEPING_INTERVAL_SECONDS = 3600
 
@@ -430,16 +426,13 @@ class TelegramPipeWorker:
             if status == "downloaded" and data:
                 result_holder["temp_path"] = data.get("temp_path")
 
-        try:
-            await self._handle_message(
-                message,
-                catch_up=False,
-                progress_callback=cb,
-                progress_extra=progress_extra,
-                intake_metadata=intake_metadata,
-            )
-        except AlreadyProcessedError:
-            raise
+        await self._handle_message(
+            message,
+            catch_up=False,
+            progress_callback=cb,
+            progress_extra=progress_extra,
+            intake_metadata=intake_metadata,
+        )
         if result_holder.get("temp_path"):
             return result_holder
         if "cdn_response" not in result_holder:
@@ -458,11 +451,11 @@ class TelegramPipeWorker:
         chat_id = getattr(chat, "id", 0)
         message_id = int(message.id)
 
-        if await self.store.is_processed(chat_id, message_id):
-            LOGGER.debug("Skipping already processed message %s:%s", chat_id, message_id)
-            if progress_callback:
-                await self._invoke_progress(progress_callback, "skipped", {"message": "Already processed"})
-            raise AlreadyProcessedError("Already processed (previous run succeeded or failed). Try another link.")
+        force_reimport = bool(progress_extra.get("force")) if progress_extra else False
+        if not force_reimport and await self.store.is_processed(chat_id, message_id):
+            LOGGER.info("Message %s:%s already processed; returning existing result instead of blocking", chat_id, message_id)
+            await self._respond_with_existing_result(chat_id, message_id, progress_callback)
+            return
 
         original_file_name = self._extract_file_name(message) or f"message_{message_id}.bin"
         file_name = storage_safe_filename(original_file_name)
@@ -811,6 +804,52 @@ class TelegramPipeWorker:
                         LOGGER.warning("Could not delete optimized temp file: %s", optimized_temp_file)
             self._release_temp_path(temp_file)
             self._release_temp_path(optimized_temp_file)
+
+    async def _respond_with_existing_result(
+        self,
+        chat_id: int,
+        message_id: int,
+        progress_callback: ProgressCallback | None,
+    ) -> None:
+        """Answer an already-imported link with the current result instead of
+        refusing outright. Prefers a live NBX lookup (the cached snapshot is
+        usually just the pending-status acceptance response, with no
+        playback URL yet); falls back to the cached snapshot if NBX can't be
+        reached. Callers that want a genuine re-download/re-transcode should
+        pass job={"force": True} into process_link()."""
+        existing = await self.store.get_processed(chat_id, message_id)
+        cdn_response = self._parse_cdn_response(existing)
+        source_id = self._extract_source_id(cdn_response)
+
+        if source_id:
+            live = await self.cdn.get_source_status(source_id)
+            if live:
+                cdn_response = live
+
+        await self._invoke_progress(progress_callback, "done", {
+            "message": "Already imported — returning the existing result. Resend with force=true to re-import.",
+            "cdn_response": cdn_response,
+            "duplicate": True,
+        })
+
+    @staticmethod
+    def _parse_cdn_response(row: dict[str, Any] | None) -> dict[str, Any] | None:
+        raw = row.get("cdn_response") if row else None
+        if not raw:
+            return None
+        try:
+            parsed = orjson.loads(raw)
+        except orjson.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    @staticmethod
+    def _extract_source_id(cdn_response: dict[str, Any] | None) -> str | None:
+        if not isinstance(cdn_response, dict):
+            return None
+        data = cdn_response.get("data") if isinstance(cdn_response.get("data"), dict) else cdn_response
+        source_id = data.get("source_id") or data.get("cdn_source_id")
+        return str(source_id) if source_id not in (None, "") else None
 
     async def _invoke_progress(
         self,
