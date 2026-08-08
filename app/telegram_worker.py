@@ -375,6 +375,13 @@ class TelegramPipeWorker:
         parsed = parse_telegram_link(link)
         if not parsed:
             raise ValueError(f"Invalid t.me URL: {link}")
+        # NBX needs a resolvable https://t.me/ URL to auto-create a media
+        # record when a handoff arrives with no asset_id/source_id attached
+        # (e.g. a link submitted directly from this dashboard rather than
+        # dispatched by NBX itself). Set unconditionally — it must reflect
+        # the link actually being processed, not a possibly-stale caller value.
+        intake_metadata = dict(intake_metadata) if intake_metadata else {}
+        intake_metadata["telegram_url"] = link
         channel_ref, message_id = parsed
         entity = await self.client.get_entity(channel_ref)
         messages = await self.client.get_messages(entity, ids=message_id)
