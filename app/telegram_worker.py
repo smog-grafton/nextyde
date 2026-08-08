@@ -404,6 +404,7 @@ class TelegramPipeWorker:
                     job["message"] = data.get("message", "Done. File deleted.")
                     job["progress_pct"] = 100
                     job["result"] = data.get("cdn_response")
+                    job["duplicate"] = bool(data.get("duplicate"))
                 elif status == "downloaded":
                     job["message"] = data.get(
                         "message",
