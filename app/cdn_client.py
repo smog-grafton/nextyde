@@ -20,6 +20,39 @@ CDN_UPLOAD_MAX_ATTEMPTS = 3
 CDN_UPLOAD_BACKOFF_SECONDS = (5, 15, 30)
 
 
+def _raise_for_status_with_detail(response: httpx.Response) -> None:
+    """Like response.raise_for_status(), but folds the server's JSON error
+    body (Laravel validation errors, in particular) into the exception
+    message. Without this, a 422 only ever surfaced as the generic
+    "Client error '422 Unprocessable Entity'" with no way to tell which
+    field NBX actually rejected."""
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        detail = ""
+        try:
+            body = response.json()
+        except ValueError:
+            body = None
+        if isinstance(body, dict):
+            parts = []
+            message = body.get("message") or body.get("error")
+            if message:
+                parts.append(str(message))
+            errors = body.get("errors")
+            if isinstance(errors, dict):
+                for field, messages in errors.items():
+                    joined = "; ".join(str(m) for m in messages) if isinstance(messages, list) else str(messages)
+                    parts.append(f"{field}: {joined}")
+            detail = " | ".join(parts)
+        if not detail:
+            detail = response.text[:500]
+        if detail:
+            LOGGER.warning("NBX rejected request: %s", detail)
+            raise httpx.HTTPStatusError(f"{exc}: {detail}", request=exc.request, response=exc.response) from exc
+        raise
+
+
 class CdnClient:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -50,7 +83,7 @@ class CdnClient:
                         data=data,
                         files=files,
                     )
-                response.raise_for_status()
+                _raise_for_status_with_detail(response)
                 content_type = response.headers.get("content-type", "")
                 if "application/json" in content_type:
                     return response.json()
@@ -97,7 +130,7 @@ class CdnClient:
             params=data,
             content=chunks,
         )
-        response.raise_for_status()
+        _raise_for_status_with_detail(response)
         content_type = response.headers.get("content-type", "")
         if "application/json" in content_type:
             return response.json()
@@ -131,7 +164,7 @@ class CdnClient:
             headers=headers,
             data=data,
         )
-        response.raise_for_status()
+        _raise_for_status_with_detail(response)
         content_type = response.headers.get("content-type", "")
         if "application/json" in content_type:
             return response.json()
@@ -145,18 +178,27 @@ class CdnClient:
         data: dict[str, Any] = {
             "source_url": source_url,
             "original_filename": str(metadata.get("original_filename") or file_path.name),
-            "asset_id": str(metadata.get("cdn_asset_id") or ""),
-            "source_id": metadata.get("cdn_source_id"),
             "bytes_total": file_path.stat().st_size,
             "metadata": metadata,
         }
+        # Omit rather than send empty/null — NBX treats these as optional
+        # and will locate-or-create a media record from metadata when
+        # they're absent (e.g. a link submitted directly from this
+        # dashboard was never dispatched by NBX, so no asset/source exists
+        # yet to reference).
+        asset_id = str(metadata.get("cdn_asset_id") or "").strip()
+        if asset_id:
+            data["asset_id"] = asset_id
+        source_id = metadata.get("cdn_source_id")
+        if source_id not in (None, ""):
+            data["source_id"] = source_id
 
         response = await self._client.post(
             self.settings.cdn_upload_url,
             headers=headers,
             json=data,
         )
-        response.raise_for_status()
+        _raise_for_status_with_detail(response)
         content_type = response.headers.get("content-type", "")
         if "application/json" in content_type:
             return response.json()
