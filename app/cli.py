@@ -9,7 +9,7 @@ import asyncio
 import logging
 import sys
 
-from app.link_parser import parse_telegram_link
+from app.link_parser import TelegramMessageReference, parse_telegram_reference
 
 
 def main() -> None:
@@ -25,14 +25,15 @@ def main() -> None:
         print("Error: provide a t.me message URL", file=sys.stderr)
         sys.exit(1)
     url = sys.argv[2].strip()
-    parsed = parse_telegram_link(url)
-    if not parsed:
-        print(f"Error: invalid t.me URL: {url}", file=sys.stderr)
+    try:
+        reference = parse_telegram_reference(url)
+    except ValueError as exc:
+        print(f"Error: invalid Telegram message reference: {exc}", file=sys.stderr)
         sys.exit(1)
-    asyncio.run(_run_process_link(url, parsed))
+    asyncio.run(_run_process_link(url, reference))
 
 
-async def _run_process_link(url: str, parsed: tuple[str, int]) -> None:
+async def _run_process_link(url: str, reference: TelegramMessageReference) -> None:
     from app.config import Settings
     from app.telegram_worker import TelegramPipeWorker
 
@@ -57,15 +58,24 @@ async def _run_process_link(url: str, parsed: tuple[str, int]) -> None:
             sys.exit(1)
 
     try:
-        channel_ref, message_id = parsed
-        entity = await worker.client.get_entity(channel_ref)
-        messages = await worker.client.get_messages(entity, ids=message_id)
-        message = messages[0] if isinstance(messages, list) and messages else messages
-        if not message:
-            print("Message not found or not accessible", file=sys.stderr)
+        _, message = await worker.resolve_message_reference(reference)
+        if not worker._is_supported_media(message):
+            print(
+                f"Message {reference.message_id} exists but has no supported downloadable video/document",
+                file=sys.stderr,
+            )
             sys.exit(1)
-        await worker._handle_message(message, catch_up=False)
+        await worker._handle_message(
+            message,
+            catch_up=False,
+            intake_metadata={
+                "telegram_url": reference.canonical_url(),
+                "telegram_reference_type": reference.type,
+                "telegram_peer_id": reference.peer_id,
+                "telegram_channel_internal_id": reference.channel_internal_id,
+                "telegram_topic_id": reference.topic_id,
+            },
+        )
     finally:
         await worker.cdn.close()
         await worker.client.disconnect()
-

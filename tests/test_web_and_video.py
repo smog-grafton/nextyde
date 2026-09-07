@@ -117,11 +117,26 @@ class DummyWorker:
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
 
-    async def process_link(self, link: str, job: dict | None = None) -> dict:
+    async def process_link(
+        self,
+        link: str,
+        job: dict | None = None,
+        intake_metadata: dict | None = None,
+    ) -> dict:
         if job is not None:
             job["status"] = "done"
             job["message"] = "Done."
         return {"link": link}
+
+    async def inspect_link(self, link: str) -> dict:
+        return {
+            "reference": {"type": "private_channel_message", "message_id": 45515},
+            "channel": "Partner Movies",
+            "file_name": "movie.mkv",
+            "size": 1024,
+            "mime_type": "video/x-matroska",
+            "access": "ready",
+        }
 
 
 class WebBehaviorTests(unittest.IsolatedAsyncioTestCase):
@@ -173,6 +188,29 @@ class WebBehaviorTests(unittest.IsolatedAsyncioTestCase):
                 None,
             )
         self.assertEqual(ctx.exception.status_code, 422)
+
+    def test_normalize_private_topic_link_uses_final_message_id(self) -> None:
+        normalized = web._normalize_links("https://t.me/c/2489865945/10/45517", None)
+
+        self.assertEqual(
+            normalized,
+            [{"link": "https://t.me/c/2489865945/10/45517", "link_key": "-1002489865945:45517"}],
+        )
+
+    def test_normalize_direct_ids_builds_private_message_link(self) -> None:
+        normalized = web._normalize_links(None, None, -1002489865945, 45517, 10)
+
+        self.assertEqual(normalized[0]["link"], "https://t.me/c/2489865945/10/45517")
+        self.assertEqual(normalized[0]["link_key"], "-1002489865945:45517")
+
+    async def test_api_inspect_checks_source_without_queuing_download(self) -> None:
+        response = await web.api_inspect(
+            web.InspectRequest(link="https://t.me/c/2489865945/45515")
+        )
+
+        self.assertEqual(response["access"], "ready")
+        self.assertEqual(response["file_name"], "movie.mkv")
+        self.assertEqual(web.jobs, {})
 
     async def test_api_process_reuses_existing_active_job(self) -> None:
         web.jobs["existing-job"] = {
