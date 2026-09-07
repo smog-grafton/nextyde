@@ -417,11 +417,16 @@ async def api_inspect(req: InspectRequest):
 
 
 def _public_telescope_job(job: dict) -> dict:
-    return {
+    public = {
         key: value
         for key, value in job.items()
         if key not in {"multipart_upload_id", "multipart_parts", "metadata"}
     }
+    metadata = job.get("metadata") or {}
+    public["streamed_bytes"] = int(metadata.get("streamed_bytes") or job.get("bytes_transferred") or 0)
+    public["transfer_speed_bytes_per_second"] = int(metadata.get("transfer_speed_bytes_per_second") or 0)
+    public["eta_seconds"] = metadata.get("eta_seconds")
+    return public
 
 
 async def _submit_telescope(req: TelescopeRequest) -> dict:
@@ -1088,7 +1093,7 @@ def _html() -> str:
 
   <script>
     const TERMINAL_STATUSES = new Set(['done', 'ready', 'failed', 'cancelled', 'destroyed', 'expired']);
-    const CANCELLABLE_STATUSES = new Set(['queued', 'resolving', 'finding_message', 'waiting_for_slot', 'transferring', 'downloading', 'waiting_to_prepare', 'preparing', 'uploading']);
+    const CANCELLABLE_STATUSES = new Set(['queued', 'retrying', 'resolving', 'finding_message', 'waiting_for_slot', 'transferring', 'downloading', 'waiting_to_prepare', 'preparing', 'uploading']);
     const form = document.getElementById('form');
     const linksInput = document.getElementById('linksInput');
     const submitBtn = document.getElementById('submitBtn');
@@ -1243,8 +1248,10 @@ def _html() -> str:
           progress_pct: job.progress,
           object_url: job.result && job.result.public_url,
           message: job.status === 'transferring'
-            ? 'Streaming directly to object storage: ' + Number(job.progress || 0) + '%'
-            : (job.last_error || String(job.status || '').replaceAll('_', ' '))
+            ? 'Receiving Telegram media: ' + Number(job.progress || 0) + '% (' + (Number(job.streamed_bytes || 0) / 1048576).toFixed(1) + ' MiB received; ' + (Number(job.bytes_transferred || 0) / 1048576).toFixed(1) + ' MiB durable)'
+            : (job.status === 'retrying'
+              ? 'Telegram stream stalled; retrying automatically.'
+              : (job.last_error || String(job.status || '').replaceAll('_', ' ')))
         }));
         const list = responses[0].concat(telescope).sort((a, b) => Number(b.updated_at || b.updated_ts || 0) - Number(a.updated_at || a.updated_ts || 0));
         const active = list.filter((job) => !TERMINAL_STATUSES.has(job.status));

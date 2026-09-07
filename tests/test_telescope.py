@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,7 +10,7 @@ from unittest.mock import patch
 
 from app.db import StateStore
 from app.object_storage import ObjectStorageManager, ObjectStorageTarget, S3MultipartUploader
-from app.telescope import TelescopeScheduler
+from app.telescope import TelescopeScheduler, TelescopeTransferStalledError
 
 
 def target(key: str, *, priority: int = 0, used: int = 0) -> ObjectStorageTarget:
@@ -137,6 +138,166 @@ class MultipartUploaderTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TelescopeStateStoreTests(unittest.IsolatedAsyncioTestCase):
+    async def test_callback_retry_does_not_fake_transfer_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = StateStore(str(Path(temp_dir) / "state.db"))
+            await store.init()
+            created = await store.create_telescope_job(
+                {
+                    "job_id": "callback-job",
+                    "telegram_url": "https://t.me/demo/1",
+                    "reference": {"type": "public_channel_message", "username": "demo", "message_id": 1},
+                    "storage_target": "auto",
+                }
+            )
+            await store.enqueue_telescope_callback(
+                {
+                    "event_id": "event-1",
+                    "job_id": "callback-job",
+                    "event_type": "progress",
+                    "payload": {"event_id": "event-1"},
+                }
+            )
+            await store.mark_telescope_callback_failed("event-1", "callback-job", "HTTP 404", 0)
+            updated = await store.get_telescope_job("callback-job")
+
+            self.assertEqual(updated["updated_at"], created["updated_at"])
+            self.assertEqual(updated["callback_attempts"], 1)
+
+    async def _transfer_fixture(self, stream):
+        temp_dir = tempfile.TemporaryDirectory()
+        store = StateStore(str(Path(temp_dir.name) / "state.db"))
+        await store.init()
+        await store.create_telescope_job(
+            {
+                "job_id": "transfer-job",
+                "telegram_url": "https://t.me/demo/1",
+                "reference": {"type": "public_channel_message", "username": "demo", "message_id": 1},
+                "storage_target": "demo",
+            }
+        )
+        message = SimpleNamespace(
+            media=object(),
+            file=SimpleNamespace(size=20 * 1024 * 1024, mime_type="video/mp4"),
+        )
+
+        class Client:
+            def iter_download(self, *args, **kwargs):
+                return stream
+
+        settings = SimpleNamespace(
+            telescope_max_active_jobs=4,
+            telescope_max_downloads_per_channel=2,
+            telescope_callback_timeout_seconds=5,
+            telescope_callback_url=None,
+            telescope_callback_secret=None,
+            telescope_telegram_stall_timeout_seconds=0.02,
+            telescope_multipart_part_size_mb=8,
+            telescope_multipart_max_attempts=2,
+            telescope_upload_retry_base_ms=100,
+            download_chunk_size=1024 * 1024,
+        )
+
+        class Worker:
+            def __init__(self):
+                self.settings = settings
+                self.client = Client()
+
+            async def resolve_message_reference(self, reference):
+                return object(), message
+
+            def _is_supported_media(self, value):
+                return True
+
+            def _extract_file_name(self, value):
+                return "movie.mp4"
+
+        storage_target = replace(target("demo"), capacity_bytes=0)
+        scheduler = TelescopeScheduler(Worker(), store, ObjectStorageManager({"demo": storage_target}))
+        return temp_dir, store, scheduler
+
+    async def test_transfer_reports_telegram_bytes_before_first_s3_part(self) -> None:
+        class OneChunkStream:
+            def __init__(self):
+                self.sent = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self.sent:
+                    raise StopAsyncIteration
+                self.sent = True
+                return b"x" * (512 * 1024)
+
+            async def close(self):
+                return None
+
+        temp_dir, store, scheduler = await self._transfer_fixture(OneChunkStream())
+        observed = {}
+
+        class InspectingUploader:
+            async def upload(self, chunks, **kwargs):
+                iterator = chunks.__aiter__()
+                await iterator.__anext__()
+                observed.update(await store.get_telescope_job("transfer-job"))
+                await iterator.aclose()
+                return {
+                    "storage_target": "demo",
+                    "bucket": "movies",
+                    "object_key": "videos/movie.mp4",
+                    "public_url": "https://cdn.example/videos/movie.mp4",
+                    "bytes": 20 * 1024 * 1024,
+                }
+
+        try:
+            with patch("app.telescope.telethon_utils.get_input_location", return_value=(1, object())), patch(
+                "app.telescope.S3MultipartUploader", return_value=InspectingUploader()
+            ):
+                await scheduler._transfer(
+                    "transfer-job",
+                    scheduler._reference_from_job(await store.get_telescope_job("transfer-job")),
+                    asyncio.Event(),
+                )
+            self.assertEqual(observed["bytes_transferred"], 0)
+            self.assertEqual(observed["metadata"]["streamed_bytes"], 512 * 1024)
+            self.assertGreater(observed["progress"], 0)
+        finally:
+            await scheduler._http.aclose()
+            temp_dir.cleanup()
+
+    async def test_transfer_watchdog_rejects_a_silent_telegram_stream(self) -> None:
+        class SilentStream:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.sleep(60)
+
+            async def close(self):
+                return None
+
+        temp_dir, store, scheduler = await self._transfer_fixture(SilentStream())
+
+        class ConsumingUploader:
+            async def upload(self, chunks, **kwargs):
+                async for _ in chunks:
+                    pass
+
+        try:
+            with patch("app.telescope.telethon_utils.get_input_location", return_value=(1, object())), patch(
+                "app.telescope.S3MultipartUploader", return_value=ConsumingUploader()
+            ):
+                with self.assertRaisesRegex(TelescopeTransferStalledError, "no media bytes"):
+                    await scheduler._transfer(
+                        "transfer-job",
+                        scheduler._reference_from_job(await store.get_telescope_job("transfer-job")),
+                        asyncio.Event(),
+                    )
+        finally:
+            await scheduler._http.aclose()
+            temp_dir.cleanup()
+
     async def test_queue_and_multipart_state_survive_store_reopen(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "state.db"
@@ -184,6 +345,8 @@ class TelescopeStateStoreTests(unittest.IsolatedAsyncioTestCase):
                 telescope_callback_timeout_seconds=5,
                 telescope_callback_url="https://portal.example/callback",
                 telescope_callback_secret="secret",
+                telescope_job_max_attempts=3,
+                telescope_retry_delay_seconds=0,
             )
             scheduler = TelescopeScheduler(SimpleNamespace(settings=settings), store)
             try:
@@ -212,6 +375,8 @@ class TelescopeStateStoreTests(unittest.IsolatedAsyncioTestCase):
                 telescope_callback_timeout_seconds=5,
                 telescope_callback_url=None,
                 telescope_callback_secret=None,
+                telescope_job_max_attempts=3,
+                telescope_retry_delay_seconds=0,
             )
             scheduler = TelescopeScheduler(SimpleNamespace(settings=settings), store)
             for channel in ("channel_a", "channel_b"):
@@ -250,6 +415,51 @@ class TelescopeStateStoreTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertEqual(maximum_global, 4)
             self.assertEqual(maximum_by_channel, {"channel_a": 2, "channel_b": 2})
+
+    async def test_stalled_job_retries_then_becomes_failed_at_attempt_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = StateStore(str(Path(temp_dir) / "state.db"))
+            await store.init()
+            await store.create_telescope_job(
+                {
+                    "job_id": "stalled-job",
+                    "telegram_url": "https://t.me/demo/1",
+                    "reference": {"type": "public_channel_message", "username": "demo", "message_id": 1},
+                    "storage_target": "auto",
+                }
+            )
+            settings = SimpleNamespace(
+                telescope_max_active_jobs=4,
+                telescope_max_downloads_per_channel=2,
+                telescope_callback_timeout_seconds=5,
+                telescope_callback_url=None,
+                telescope_callback_secret=None,
+                telescope_job_max_attempts=2,
+                telescope_retry_delay_seconds=0,
+            )
+            scheduler = TelescopeScheduler(SimpleNamespace(settings=settings), store)
+            try:
+                await store.next_queued_telescope_jobs(1)
+                with patch.object(
+                    scheduler,
+                    "_transfer",
+                    side_effect=TelescopeTransferStalledError("Telegram produced no bytes."),
+                ):
+                    await scheduler._run_job("stalled-job")
+                self.assertEqual((await store.get_telescope_job("stalled-job"))["status"], "queued")
+
+                await store.next_queued_telescope_jobs(1)
+                with patch.object(
+                    scheduler,
+                    "_transfer",
+                    side_effect=TelescopeTransferStalledError("Telegram produced no bytes."),
+                ), self.assertLogs("telebot.telescope", level="ERROR"):
+                    await scheduler._run_job("stalled-job")
+                failed = await store.get_telescope_job("stalled-job")
+                self.assertEqual(failed["status"], "failed")
+                self.assertEqual(failed["attempts"], 2)
+            finally:
+                await scheduler._http.aclose()
 
 
 if __name__ == "__main__":

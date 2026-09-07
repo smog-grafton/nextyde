@@ -96,6 +96,9 @@ class Settings:
     telescope_multipart_part_size_mb: int
     telescope_multipart_max_attempts: int
     telescope_upload_retry_base_ms: int
+    telescope_telegram_stall_timeout_seconds: int
+    telescope_job_max_attempts: int
+    telescope_retry_delay_seconds: int
     telescope_callback_url: str | None
     telescope_callback_secret: str | None
     telescope_callback_timeout_seconds: int
@@ -206,7 +209,7 @@ class Settings:
             ),
             telescope_multipart_part_size_mb=max(
                 5,
-                int(os.getenv("TELESCOPE_MULTIPART_PART_SIZE_MB", "32")),
+                int(os.getenv("TELESCOPE_MULTIPART_PART_SIZE_MB", "8")),
             ),
             telescope_multipart_max_attempts=max(
                 1,
@@ -215,6 +218,18 @@ class Settings:
             telescope_upload_retry_base_ms=max(
                 100,
                 int(os.getenv("TELESCOPE_UPLOAD_RETRY_BASE_MS", "1000")),
+            ),
+            telescope_telegram_stall_timeout_seconds=max(
+                30,
+                int(os.getenv("TELESCOPE_TELEGRAM_STALL_TIMEOUT_SECONDS", "120")),
+            ),
+            telescope_job_max_attempts=max(
+                1,
+                int(os.getenv("TELESCOPE_JOB_MAX_ATTEMPTS", "3")),
+            ),
+            telescope_retry_delay_seconds=max(
+                1,
+                int(os.getenv("TELESCOPE_RETRY_DELAY_SECONDS", "10")),
             ),
             telescope_callback_url=(os.getenv("TELESCOPE_CALLBACK_URL") or "").strip() or None,
             telescope_callback_secret=(os.getenv("TELESCOPE_CALLBACK_SECRET") or "").strip() or None,

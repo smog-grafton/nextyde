@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import logging
 import os
 from pathlib import PurePosixPath
 from typing import Any, AsyncIterator, Awaitable, Callable
@@ -13,6 +14,7 @@ from botocore.client import Config
 
 ProgressCallback = Callable[[int, int, str, list[dict[str, Any]]], Awaitable[None]]
 VerifyCallback = Callable[[], Awaitable[None]]
+LOGGER = logging.getLogger("telebot.object_storage")
 
 
 def _bool(name: str, default: bool = False) -> bool:
@@ -191,11 +193,24 @@ class S3MultipartUploader:
         )
 
     async def create_upload(self, object_key: str, mime_type: str) -> str:
+        started = asyncio.get_running_loop().time()
+        LOGGER.info(
+            "Starting S3 multipart upload: target=%s bucket=%s key=%s",
+            self.target.key,
+            self.target.bucket,
+            object_key,
+        )
         response = await asyncio.to_thread(
             self.client.create_multipart_upload,
             Bucket=self.target.bucket,
             Key=object_key,
             ContentType=mime_type or "application/octet-stream",
+        )
+        LOGGER.info(
+            "S3 multipart upload created: target=%s key=%s elapsed=%.2fs",
+            self.target.key,
+            object_key,
+            asyncio.get_running_loop().time() - started,
         )
         return str(response["UploadId"])
 
@@ -334,7 +349,17 @@ class S3MultipartUploader:
         last_error: Exception | None = None
         for attempt in range(1, self.max_attempts + 1):
             try:
-                return await asyncio.to_thread(
+                started = asyncio.get_running_loop().time()
+                LOGGER.info(
+                    "Uploading S3 part: target=%s key=%s part=%s bytes=%s attempt=%s/%s",
+                    self.target.key,
+                    object_key,
+                    part_number,
+                    len(body),
+                    attempt,
+                    self.max_attempts,
+                )
+                response = await asyncio.to_thread(
                     self.client.upload_part,
                     Bucket=self.target.bucket,
                     Key=object_key,
@@ -342,6 +367,14 @@ class S3MultipartUploader:
                     PartNumber=part_number,
                     Body=body,
                 )
+                LOGGER.info(
+                    "S3 part uploaded: target=%s key=%s part=%s elapsed=%.2fs",
+                    self.target.key,
+                    object_key,
+                    part_number,
+                    asyncio.get_running_loop().time() - started,
+                )
+                return response
             except Exception as exc:  # noqa: BLE001
                 last_error = exc
                 if attempt < self.max_attempts:

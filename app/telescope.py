@@ -24,6 +24,10 @@ LOGGER = logging.getLogger("telebot.telescope")
 TERMINAL_STATUSES = {"ready", "failed", "cancelled"}
 
 
+class TelescopeTransferStalledError(TimeoutError):
+    """Raised when Telegram yields no data for the configured watchdog period."""
+
+
 class TelescopeScheduler:
     """Persistent direct Telegram-to-object-storage queue and callback dispatcher."""
 
@@ -166,20 +170,43 @@ class TelescopeScheduler:
                 # return this resumable job to the queue.
                 await self.store.update_telescope_job(job_id, status="queued")
             raise
+        except TelescopeTransferStalledError as exc:
+            current = await self.store.get_telescope_job(job_id)
+            attempts = int((current or {}).get("attempts") or 0)
+            if attempts < self.settings.telescope_job_max_attempts:
+                LOGGER.warning(
+                    "Telescope job %s stalled on Telegram attempt %s/%s; retrying in %ss",
+                    job_id,
+                    attempts,
+                    self.settings.telescope_job_max_attempts,
+                    self.settings.telescope_retry_delay_seconds,
+                )
+                await self.store.update_telescope_job(
+                    job_id,
+                    status="retrying",
+                    last_error=str(exc)[:4000],
+                )
+                await asyncio.sleep(self.settings.telescope_retry_delay_seconds)
+                await self.store.update_telescope_job(job_id, status="queued")
+            else:
+                await self._fail_job(job_id, exc)
         except Exception as exc:  # noqa: BLE001
-            LOGGER.exception("Telescope job %s failed: %s", job_id, exc)
-            await self.store.update_telescope_job(
-                job_id,
-                status="failed",
-                last_error=str(exc)[:4000],
-                completed_at=time.time(),
-            )
-            failed = await self.store.get_telescope_job(job_id)
-            if failed:
-                await self._emit_event(failed, "failed")
+            await self._fail_job(job_id, exc)
         finally:
             self._cancel_events.pop(job_id, None)
             self._wake.set()
+
+    async def _fail_job(self, job_id: str, exc: Exception) -> None:
+        LOGGER.exception("Telescope job %s failed: %s", job_id, exc)
+        await self.store.update_telescope_job(
+            job_id,
+            status="failed",
+            last_error=str(exc)[:4000],
+            completed_at=time.time(),
+        )
+        failed = await self.store.get_telescope_job(job_id)
+        if failed:
+            await self._emit_event(failed, "failed")
 
     async def _transfer(
         self,
@@ -236,21 +263,84 @@ class TelescopeScheduler:
 
         dc_id, input_location = telethon_utils.get_input_location(message.media or message)
 
-        async def telegram_chunks():
-            async for chunk in self.worker.client.iter_download(
-                input_location,
-                offset=transferred,
-                request_size=self.worker.settings.download_chunk_size,
-                file_size=total_bytes,
-                dc_id=dc_id,
-            ):
-                if cancel_event.is_set():
-                    raise asyncio.CancelledError("Telescope import cancelled")
-                if chunk:
-                    yield bytes(chunk)
-
         last_event_pct = int(job.get("progress") or 0) // 10 * 10
         started = time.monotonic()
+        last_stream_report = 0.0
+        last_logged_pct = -1
+        streamed = transferred
+        durable = transferred
+        transfer_metadata = dict(job.get("metadata") or {})
+
+        async def telegram_chunks():
+            nonlocal last_event_pct, last_stream_report, last_logged_pct, streamed
+            request_size = min(512 * 1024, max(4096, self.worker.settings.download_chunk_size))
+            request_size -= request_size % 4096
+            stream = self.worker.client.iter_download(
+                input_location,
+                offset=transferred,
+                request_size=request_size,
+                chunk_size=request_size,
+                file_size=total_bytes,
+                dc_id=dc_id,
+            )
+            iterator = stream.__aiter__()
+            try:
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(
+                            iterator.__anext__(),
+                            timeout=self.settings.telescope_telegram_stall_timeout_seconds,
+                        )
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError as exc:
+                        raise TelescopeTransferStalledError(
+                            "Telegram produced no media bytes for "
+                            f"{self.settings.telescope_telegram_stall_timeout_seconds} seconds."
+                        ) from exc
+
+                    if cancel_event.is_set():
+                        raise asyncio.CancelledError("Telescope import cancelled")
+                    if not chunk:
+                        continue
+
+                    chunk_bytes = bytes(chunk)
+                    streamed += len(chunk_bytes)
+                    pct = min(99, int(streamed * 100 / total_bytes))
+                    now = time.monotonic()
+                    if last_stream_report == 0.0 or now - last_stream_report >= 2.0 or pct >= last_logged_pct + 10:
+                        elapsed = max(0.001, now - started)
+                        speed = int(max(0, streamed - transferred) / elapsed)
+                        transfer_metadata["streamed_bytes"] = streamed
+                        transfer_metadata["durable_bytes"] = durable
+                        transfer_metadata["transfer_speed_bytes_per_second"] = speed
+                        transfer_metadata["eta_seconds"] = int((total_bytes - streamed) / speed) if speed else None
+                        await self.store.update_telescope_job(
+                            job_id,
+                            status="transferring",
+                            progress=pct,
+                            metadata_json=transfer_metadata,
+                        )
+                        last_stream_report = now
+                        if pct >= last_logged_pct + 10 or last_logged_pct < 0:
+                            last_logged_pct = pct // 10 * 10
+                            LOGGER.info(
+                                "Telescope job %s receiving Telegram media: %s/%s bytes (%s%%, %s bytes/s)",
+                                job_id,
+                                streamed,
+                                total_bytes,
+                                pct,
+                                speed,
+                            )
+                        milestone = pct // 10 * 10
+                        if milestone >= last_event_pct + 10:
+                            last_event_pct = milestone
+                            current_job = await self.store.get_telescope_job(job_id)
+                            if current_job:
+                                await self._emit_event(current_job, "progress", discriminator=str(milestone))
+                    yield chunk_bytes
+            finally:
+                await stream.close()
 
         async def progress(
             current: int,
@@ -258,13 +348,15 @@ class TelescopeScheduler:
             current_upload_id: str,
             current_parts: list[dict[str, Any]],
         ) -> None:
-            nonlocal last_event_pct
+            nonlocal durable, last_event_pct
+            durable = current
             pct = min(99, int(current * 100 / total)) if total else 0
             elapsed = max(0.001, time.monotonic() - started)
             speed = int(max(0, current - transferred) / elapsed)
-            metadata = dict(job.get("metadata") or {})
-            metadata["transfer_speed_bytes_per_second"] = speed
-            metadata["eta_seconds"] = int((total - current) / speed) if speed else None
+            transfer_metadata["streamed_bytes"] = max(streamed, current)
+            transfer_metadata["durable_bytes"] = current
+            transfer_metadata["transfer_speed_bytes_per_second"] = speed
+            transfer_metadata["eta_seconds"] = int((total - current) / speed) if speed else None
             await self.store.update_telescope_job(
                 job_id,
                 status="transferring",
@@ -272,7 +364,7 @@ class TelescopeScheduler:
                 bytes_transferred=current,
                 multipart_upload_id=current_upload_id,
                 multipart_parts_json=current_parts,
-                metadata_json=metadata,
+                metadata_json=transfer_metadata,
             )
             milestone = pct // 10 * 10
             if milestone >= last_event_pct + 10:
@@ -308,12 +400,12 @@ class TelescopeScheduler:
         )
         await self.store.update_telescope_job(
             job_id,
-            status="callback_pending" if callback_configured else "ready",
+            status="ready",
             progress=100,
             bytes_transferred=total_bytes,
             result_json=result,
             callback_status="pending" if callback_configured else "not_configured",
-            completed_at=None if callback_configured else time.time(),
+            completed_at=time.time(),
         )
         completed = await self.store.get_telescope_job(job_id)
         if completed:

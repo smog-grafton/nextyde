@@ -261,7 +261,7 @@ class StateStore:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 "UPDATE telescope_jobs SET status = 'queued', updated_at = ? "
-                "WHERE status IN ('resolving', 'waiting_for_slot', 'transferring', 'uploading', 'verifying')",
+                "WHERE status IN ('resolving', 'waiting_for_slot', 'transferring', 'uploading', 'verifying', 'retrying')",
                 (time.time(),),
             )
             await db.commit()
@@ -327,8 +327,8 @@ class StateStore:
                 (error[:2000], time.time() + delay, event_id),
             )
             await db.execute(
-                "UPDATE telescope_jobs SET callback_status = 'pending', callback_attempts = callback_attempts + 1, updated_at = ? WHERE job_id = ?",
-                (time.time(), job_id),
+                "UPDATE telescope_jobs SET callback_status = 'pending', callback_attempts = callback_attempts + 1 WHERE job_id = ?",
+                (job_id,),
             )
             await db.commit()
 

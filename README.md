@@ -50,7 +50,7 @@ Telescope is the fast, original-only path alongside the existing Tele-OB/NBX wor
 Portal -> Teletyde -> Telegram chunk iterator -> S3 multipart upload -> verify object -> signed Portal callback
 ```
 
-It does not download the complete movie to local disk and does not involve NBX. Each active transfer uses bounded multipart working memory (32 MB parts by default, plus a temporary part copy and SDK/chunk overhead), independent of the movie's total size. The original container is preserved; Telescope does not claim to transcode MKV, generate HLS, compress, or create Fast Start MP4 output.
+It does not download the complete movie to local disk and does not involve NBX. Each active transfer uses bounded multipart working memory (8 MB parts by default, plus a temporary part copy and SDK/chunk overhead), independent of the movie's total size. The original container is preserved; Telescope does not claim to transcode MKV, generate HLS, compress, or create Fast Start MP4 output.
 
 The SQLite queue uses WAL mode and persists jobs, Telegram references, target/object identity, byte progress, multipart upload IDs and completed ETags. Interrupted transfers are returned to the queue on restart and continue from their last completed S3 part. Global direct-transfer concurrency defaults to four, with a separate per-channel limit of two. These limits do not change the legacy download or FFmpeg pools.
 
@@ -71,6 +71,8 @@ Worker API:
 - `POST /api/worker/telescope/jobs/{job_id}/retry`
 
 The web dashboard exposes the same direct-storage choice and shows both legacy and Telescope jobs together.
+
+Transfer progress is sampled while Telegram chunks arrive, while `bytes_transferred` remains the crash-safe number already committed as S3 parts. If Telegram produces no bytes for `TELESCOPE_TELEGRAM_STALL_TIMEOUT_SECONDS`, Telescope closes that stream and retries the persistent job up to `TELESCOPE_JOB_MAX_ATTEMPTS`; it no longer remains indefinitely at `transferring / 0%`.
 
 ## Deployment guides
 
