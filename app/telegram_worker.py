@@ -20,7 +20,11 @@ from app.cdn_client import CdnClient
 from app.config import Settings
 from app.db import StateStore
 from app.filename import extract_metadata, storage_safe_filename
-from app.link_parser import TELEGRAM_LINK_RE
+from app.link_parser import (
+    TelegramMessageReference,
+    find_telegram_message_reference,
+    parse_telegram_reference,
+)
 from app.media_tools import detect_media_tools
 from app.temp_url import build_signed_temp_url
 from app.video_prepare import (
@@ -30,14 +34,17 @@ from app.video_prepare import (
 )
 
 LOGGER = logging.getLogger("telebot")
-MEDIA_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm"}
+MEDIA_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".mpeg", ".mpg", ".ts", ".m2ts"}
 
 
 class JobCancelledError(Exception):
     """Raised when a job is cancelled via the web UI or API."""
 
 
-TELEGRAM_LINK_PATTERN = TELEGRAM_LINK_RE
+class TelegramSourceError(RuntimeError):
+    """Operationally useful Telegram source resolution failure."""
+
+
 HOUSEKEEPING_INTERVAL_SECONDS = 3600
 
 
@@ -292,13 +299,97 @@ class TelegramPipeWorker:
             except Exception as exc:  # noqa: BLE001
                 LOGGER.warning("Could not scan %r: %s", target, exc)
 
+    async def _resolve_reference_entity(self, reference: TelegramMessageReference) -> Any:
+        if not await self.client.is_user_authorized():
+            raise TelegramSourceError("Telegram session expired — authentication is required.")
+
+        if reference.username:
+            try:
+                return await self.client.get_entity(reference.username)
+            except Exception as exc:  # noqa: BLE001
+                raise TelegramSourceError(
+                    f"Telegram channel @{reference.username} does not exist or is not accessible to the authenticated Telebot account."
+                ) from exc
+
+        # Integer get_entity() depends on Telethon's session entity cache. Try it
+        # first, then refresh dialogs so a fresh/restarted process can resolve a
+        # private channel the account has already joined.
+        try:
+            return await self.client.get_entity(reference.peer_id)
+        except Exception:  # noqa: BLE001
+            pass
+
+        try:
+            async for dialog in self.client.iter_dialogs():
+                entity = dialog.entity
+                try:
+                    entity_peer_id = telethon_utils.get_peer_id(entity)
+                except (TypeError, ValueError):
+                    entity_peer_id = None
+                if (
+                    getattr(entity, "id", None) == reference.channel_internal_id
+                    or entity_peer_id == reference.peer_id
+                ):
+                    return entity
+        except Exception as exc:  # noqa: BLE001
+            raise TelegramSourceError(
+                f"Could not refresh Telegram channel access for peer {reference.peer_id}: {exc}"
+            ) from exc
+
+        raise TelegramSourceError(
+            "Telegram private channel is not accessible to the authenticated Telebot account. "
+            f"Peer: {reference.peer_id}. Confirm that this account has joined the channel; admin access is not required."
+        )
+
+    async def _fetch_reference_message(self, reference: TelegramMessageReference, entity: Any) -> Any:
+        try:
+            messages = await self.client.get_messages(entity, ids=reference.message_id)
+        except Exception as exc:  # noqa: BLE001
+            raise TelegramSourceError(
+                f"Telegram channel resolved, but message {reference.message_id} could not be retrieved: {exc}"
+            ) from exc
+        message = messages[0] if isinstance(messages, list) and messages else messages
+        if not message:
+            raise TelegramSourceError(
+                f"Telegram channel resolved successfully, but message {reference.message_id} does not exist or is inaccessible."
+            )
+        return message
+
+    async def resolve_message_reference(self, reference: TelegramMessageReference) -> tuple[Any, Any]:
+        entity = await self._resolve_reference_entity(reference)
+        message = await self._fetch_reference_message(reference, entity)
+        return entity, message
+
+    async def inspect_link(self, link: str) -> dict[str, Any]:
+        """Resolve and inspect a Telegram source without downloading its media."""
+        try:
+            reference = parse_telegram_reference(link)
+        except ValueError as exc:
+            raise TelegramSourceError(str(exc)) from exc
+        entity, message = await self.resolve_message_reference(reference)
+        if not self._is_supported_media(message):
+            raise TelegramSourceError(
+                f"Telegram message {reference.message_id} exists but contains no supported downloadable video/document."
+            )
+        file_name = self._extract_file_name(message)
+        return {
+            "reference": reference.as_dict(),
+            "channel": getattr(entity, "title", None) or getattr(entity, "username", None),
+            "file_name": file_name,
+            "size": int(getattr(message.file, "size", 0) or 0),
+            "mime_type": getattr(message.file, "mime_type", None),
+            "access": "ready",
+        }
+
     def _is_supported_media(self, message: Any) -> bool:
         if not getattr(message, "media", None):
             return False
         file_name = self._extract_file_name(message)
         if not file_name:
             return False
-        return Path(file_name).suffix.lower() in MEDIA_EXTENSIONS
+        extension = Path(file_name).suffix.lower()
+        mime_type = str(getattr(getattr(message, "file", None), "mime_type", "") or "").lower()
+        return extension in MEDIA_EXTENSIONS or mime_type.startswith("video/")
 
     def _extract_file_name(self, message: Any) -> str | None:
         if not getattr(message, "document", None):
@@ -327,30 +418,16 @@ class TelegramPipeWorker:
         chat_id = getattr(chat, "id", None)
         if chat_id not in self._watched_ids:
             return
-        match = TELEGRAM_LINK_PATTERN.search(text)
-        if not match:
-            return
-        channel_ref, msg_id_str = match.group(1), match.group(2)
-        try:
-            msg_id = int(msg_id_str)
-        except ValueError:
+        reference = find_telegram_message_reference(text)
+        if not reference:
             return
         try:
-            entity = await self.client.get_entity(channel_ref)
+            _, target = await self.resolve_message_reference(reference)
         except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Could not resolve t.me link %s: %s", text.strip(), exc)
+            LOGGER.warning("Could not resolve Telegram link in watched message: %s", exc)
             return
-        try:
-            fetched = await self.client.get_messages(entity, ids=msg_id)
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Could not fetch message %s: %s", msg_id, exc)
-            return
-        if not fetched or (isinstance(fetched, list) and not fetched):
-            LOGGER.warning("Message %s not found", msg_id)
-            return
-        target = fetched[0] if isinstance(fetched, list) else fetched
         if not self._is_supported_media(target):
-            LOGGER.debug("Message %s is not supported media", msg_id)
+            LOGGER.debug("Message %s is not supported media", reference.message_id)
             return
         await self._handle_message(target, catch_up=False)
 
@@ -363,8 +440,6 @@ class TelegramPipeWorker:
     ) -> dict[str, Any]:
         """Fetch a t.me message by URL, process it (download → CDN → notify), return result or raise.
         If job dict is provided, it is updated with status, progress_pct, message, and result/error."""
-        from app.link_parser import parse_telegram_link
-
         progress_extra = job if job is not None else {}
         if job is not None:
             job["status"] = "queued"
@@ -372,22 +447,42 @@ class TelegramPipeWorker:
             job["message"] = "Resolving link…"
             job["updated_ts"] = time.time()
 
-        parsed = parse_telegram_link(link)
-        if not parsed:
-            raise ValueError(f"Invalid t.me URL: {link}")
+        try:
+            reference = parse_telegram_reference(link)
+        except ValueError as exc:
+            raise TelegramSourceError(f"Unsupported Telegram URL format: {exc}") from exc
         # NBX needs a resolvable https://t.me/ URL to auto-create a media
         # record when a handoff arrives with no asset_id/source_id attached
         # (e.g. a link submitted directly from this dashboard rather than
         # dispatched by NBX itself). Set unconditionally — it must reflect
         # the link actually being processed, not a possibly-stale caller value.
         intake_metadata = dict(intake_metadata) if intake_metadata else {}
-        intake_metadata["telegram_url"] = link
-        channel_ref, message_id = parsed
-        entity = await self.client.get_entity(channel_ref)
-        messages = await self.client.get_messages(entity, ids=message_id)
-        message = messages[0] if isinstance(messages, list) and messages else messages
-        if not message:
-            raise ValueError("Message not found or not accessible")
+        intake_metadata["telegram_url"] = reference.canonical_url()
+        intake_metadata["telegram_reference_type"] = reference.type
+        intake_metadata["telegram_peer_id"] = reference.peer_id
+        intake_metadata["telegram_channel_internal_id"] = reference.channel_internal_id
+        intake_metadata["telegram_topic_id"] = reference.topic_id
+
+        if job is not None:
+            job["status"] = "resolving"
+            job["message"] = "Connecting to Telegram channel…"
+            job["telegram_reference"] = reference.as_dict()
+            job["updated_ts"] = time.time()
+        await self._invoke_progress(
+            progress_callback,
+            "resolving",
+            {"message": "Connecting to Telegram channel…", "reference": reference.as_dict(), "progress_pct": 0},
+        )
+        entity = await self._resolve_reference_entity(reference)
+        if job is not None:
+            job["status"] = "finding_message"
+            job["message"] = f"Finding Telegram message {reference.message_id}…"
+            job["updated_ts"] = time.time()
+        message = await self._fetch_reference_message(reference, entity)
+        if not self._is_supported_media(message):
+            raise TelegramSourceError(
+                f"Telegram message {reference.message_id} exists but contains no supported downloadable video/document."
+            )
         result_holder: dict[str, Any] = {}
 
         async def cb(status: str, data: dict[str, Any]) -> None:
@@ -522,11 +617,14 @@ class TelegramPipeWorker:
 
         try:
             await self._invoke_progress(progress_callback, "downloading", {"file_name": file_name, "progress_pct": 0})
-            progress_state = {"last_logged_pct": -1}
+            progress_state = {"last_logged_pct": -1, "started_at": time.monotonic()}
 
             def download_progress(current: int, total: int) -> None:
                 if is_cancelled():
                     raise JobCancelledError("Job cancelled")
+                elapsed = max(0.001, time.monotonic() - progress_state["started_at"])
+                speed = int(current / elapsed)
+                eta = int((total - current) / speed) if total and speed > 0 else None
                 if total:
                     pct = int(current * 100 / total)
                     if pct != progress_state["last_logged_pct"] and pct in {1, 5, 10, 25, 50, 75, 100}:
@@ -535,6 +633,15 @@ class TelegramPipeWorker:
                 if progress_extra is not None and total:
                     progress_extra["progress_pct"] = min(99, int(current * 100 / total))
                     progress_extra["file_name"] = file_name
+                    progress_extra["downloaded_bytes"] = current
+                    progress_extra["total_bytes"] = total
+                    progress_extra["speed_bytes_per_second"] = speed
+                    progress_extra["eta_seconds"] = eta
+                    progress_extra["message"] = (
+                        f"Downloading {file_name}: {current / (1024 ** 2):.1f} MB / "
+                        f"{total / (1024 ** 2):.1f} MB ({int(current * 100 / total)}%)"
+                    )
+                    progress_extra["updated_ts"] = time.time()
 
             LOGGER.info(
                 "Downloading %s from %s (msg %s)",

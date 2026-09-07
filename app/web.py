@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
 from app.config import Settings
-from app.link_parser import parse_telegram_link
+from app.link_parser import parse_telegram_reference
 from app.media_tools import detect_media_tools
 from app.temp_url import resolve_signed_temp_path
 from app.telegram_worker import JobCancelledError, TelegramPipeWorker
@@ -31,7 +31,7 @@ app_settings: Settings | None = None
 authorized = False
 
 TERMINAL_STATUSES = {"done", "failed", "cancelled", "destroyed", "expired"}
-CANCELLABLE_STATUSES = {"queued", "downloading", "waiting_to_prepare", "preparing", "uploading"}
+CANCELLABLE_STATUSES = {"queued", "resolving", "finding_message", "downloading", "waiting_to_prepare", "preparing", "uploading"}
 
 
 def _touch_job(job: dict) -> None:
@@ -142,19 +142,35 @@ def _split_link_inputs(*values: str | None) -> list[str]:
     return links
 
 
-def _normalize_links(link: str | None, links: list[str] | None) -> list[dict[str, str]]:
+def _normalize_links(
+    link: str | None,
+    links: list[str] | None,
+    telegram_chat_id: int | None = None,
+    telegram_message_id: int | None = None,
+    telegram_topic_id: int | None = None,
+) -> list[dict[str, str]]:
     raw_links = _split_link_inputs(link, *(links or []))
+    if not raw_links and telegram_chat_id is not None and telegram_message_id is not None:
+        try:
+            direct_reference = parse_telegram_reference(
+                telegram_chat_id=telegram_chat_id,
+                telegram_message_id=telegram_message_id,
+                telegram_topic_id=telegram_topic_id,
+            )
+        except ValueError as exc:
+            raise HTTPException(422, detail=str(exc)) from exc
+        raw_links.append(direct_reference.canonical_url())
     if not raw_links:
-        raise HTTPException(422, detail="Paste at least one valid Telegram message link.")
+        raise HTTPException(422, detail="Paste a Telegram message link or provide chat and message IDs.")
 
     normalized: list[dict[str, str]] = []
     seen: set[str] = set()
     for raw_link in raw_links:
-        parsed = parse_telegram_link(raw_link)
-        if not parsed:
-            raise HTTPException(422, detail=f"Invalid t.me URL: {raw_link}")
-        channel_ref, message_id = parsed
-        link_key = f"{channel_ref.lower()}:{message_id}"
+        try:
+            reference = parse_telegram_reference(raw_link)
+        except ValueError as exc:
+            raise HTTPException(422, detail=f"Invalid Telegram message reference: {raw_link} ({exc})") from exc
+        link_key = reference.key
         if link_key in seen:
             continue
         seen.add(link_key)
@@ -287,6 +303,16 @@ class ProcessRequest(BaseModel):
     download_only: bool = False
     metadata: dict | None = None
     force: bool = False
+    telegram_chat_id: int | None = None
+    telegram_message_id: int | None = None
+    telegram_topic_id: int | None = None
+
+
+class InspectRequest(BaseModel):
+    link: str | None = None
+    telegram_chat_id: int | None = None
+    telegram_message_id: int | None = None
+    telegram_topic_id: int | None = None
 
 
 @app.post("/api/process")
@@ -298,7 +324,13 @@ async def api_process(req: ProcessRequest):
         )
 
     _prune_recent_jobs(worker)
-    normalized_links = _normalize_links(req.link, req.links)
+    normalized_links = _normalize_links(
+        req.link,
+        req.links,
+        req.telegram_chat_id,
+        req.telegram_message_id,
+        req.telegram_topic_id,
+    )
     download_only = req.download_only or worker.settings.download_only
 
     existing_jobs: list[dict] = []
@@ -341,6 +373,27 @@ async def api_process(req: ProcessRequest):
         payload["job_id"] = response_jobs[0]["job_id"]
         payload["status"] = response_jobs[0]["status"]
     return payload
+
+
+@app.post("/api/inspect")
+async def api_inspect(req: InspectRequest):
+    """Validate channel/message/media access without downloading the file."""
+    if not worker or not authorized:
+        raise HTTPException(
+            503,
+            detail="Telegram not logged in. Run 'python main.py' once, enter the code, then restart the web app.",
+        )
+    normalized = _normalize_links(
+        req.link,
+        None,
+        req.telegram_chat_id,
+        req.telegram_message_id,
+        req.telegram_topic_id,
+    )
+    try:
+        return await worker.inspect_link(normalized[0]["link"])
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(422, detail=_job_message(exc)) from exc
 
 
 @app.get("/api/status")
@@ -866,8 +919,8 @@ def _html() -> str:
         <p>Paste 1 to 3 Telegram message links, one per line. Duplicate links are reused instead of spawning another heavy download or worker handoff.</p>
         <form id="form">
           <label for="linksInput"><strong>Telegram message links</strong></label>
-          <textarea id="linksInput" name="links" placeholder="https://t.me/channelname/123&#10;https://t.me/channelname/124&#10;https://t.me/c/1234567890/45" required></textarea>
-          <div class="hint">The app trims blank lines and only accepts up to 3 links at a time.</div>
+          <textarea id="linksInput" name="links" placeholder="https://t.me/channelname/123&#10;https://t.me/c/2489865945/45515&#10;https://t.me/c/2489865945/10/45517" required></textarea>
+          <div class="hint">Public, private /c/, topic/thread, and official tg:// message links are supported. The Telegram account must already have access.</div>
           <label class="checkbox-row">
             <input type="checkbox" id="downloadOnly" name="download_only">
             <span>Download only. Fetch the Telegram file, expose a temporary URL in this UI, then wait for Destroy after your other tool finishes fetching it.</span>
@@ -877,6 +930,7 @@ def _html() -> str:
             <span>Force re-import, even if these links were already processed before (use this if the original file was lost, e.g. after a redeploy, and needs refetching).</span>
           </label>
           <button class="btn-primary" type="submit" id="submitBtn">Queue jobs</button>
+          <button class="btn-secondary" type="button" id="inspectBtn">Test Telegram source</button>
         </form>
         <div class="notice" id="notice"></div>
       </section>
@@ -902,10 +956,11 @@ def _html() -> str:
 
   <script>
     const TERMINAL_STATUSES = new Set(['done', 'failed', 'cancelled', 'destroyed', 'expired']);
-    const CANCELLABLE_STATUSES = new Set(['queued', 'downloading', 'waiting_to_prepare', 'preparing', 'uploading']);
+    const CANCELLABLE_STATUSES = new Set(['queued', 'resolving', 'finding_message', 'downloading', 'waiting_to_prepare', 'preparing', 'uploading']);
     const form = document.getElementById('form');
     const linksInput = document.getElementById('linksInput');
     const submitBtn = document.getElementById('submitBtn');
+    const inspectBtn = document.getElementById('inspectBtn');
     const noticeEl = document.getElementById('notice');
     const jobsPanel = document.getElementById('jobsPanel');
     const activeJobsEl = document.getElementById('activeJobs');
@@ -1131,6 +1186,32 @@ def _html() -> str:
         showNotice(error.message || 'Could not queue jobs.', 'error');
       } finally {
         submitBtn.disabled = false;
+      }
+    });
+
+    inspectBtn.addEventListener('click', async () => {
+      const links = splitLinks(linksInput.value.trim());
+      if (links.length !== 1) {
+        showNotice('Paste exactly one Telegram message link to test.', 'error');
+        return;
+      }
+      inspectBtn.disabled = true;
+      showNotice('Resolving Telegram source without downloading…', 'ok');
+      try {
+        const data = await apiJson('/api/inspect', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ link: links[0] })
+        });
+        const size = data.size ? (Number(data.size) / (1024 ** 3)).toFixed(2) + ' GB' : 'unknown size';
+        showNotice(
+          'Ready — ' + (data.channel || 'Telegram channel') + ': ' + data.file_name + ' (' + size + ', ' + (data.mime_type || 'unknown MIME') + ')',
+          'ok'
+        );
+      } catch (error) {
+        showNotice(error.message || 'Telegram source could not be verified.', 'error');
+      } finally {
+        inspectBtn.disabled = false;
       }
     });
 

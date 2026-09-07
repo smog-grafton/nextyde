@@ -26,6 +26,21 @@ For large movie files, a normal Bot API bot is a bad fit. The Bot API download l
 - `.mov`
 - `.m4v`
 - `.webm`
+- `.mpeg` / `.mpg`
+- `.ts` / `.m2ts`
+
+## Supported Telegram message references
+
+Telebot normalizes every URL into a Telegram peer, message ID, and optional topic ID before resolving media through the authenticated MTProto session. Supported inputs include:
+
+- Public messages: `https://t.me/naraboxtvcom/242`
+- Private channel/supergroup messages: `https://t.me/c/2489865945/45515`
+- Public or private topic messages: `https://t.me/c/2489865945/10/45517`
+- Harmless query parameters such as `?single` and `?thread=10`
+- Official `tg://resolve?...` and `tg://privatepost?...` deep links
+- `telegram.me` and `telegram.dog` message links
+
+Private `/c/` links use the account's existing membership. Telebot converts the internal channel ID to the marked peer ID (for example, `2489865945` becomes `-1002489865945`) and refreshes the account's dialogs if Telethon's local entity cache is cold. It never auto-joins an invite link during an import.
 
 ## Deployment guides
 
@@ -259,7 +274,7 @@ source .venv/bin/activate
 python -m app.web
 ```
 
-3. Open **http://127.0.0.1:8765** in your browser. Paste up to 3 message links (one per line), then queue the jobs. The dashboard shows active jobs and recent jobs separately, so refresh-safe actions like **Copy URL** and **Destroy** still work after the page reloads. Terminal jobs are pruned from recent history automatically after `WEB_RECENT_JOB_RETENTION_HOURS`.
+3. Open **http://127.0.0.1:8765** in your browser. Paste up to 3 message links (one per line), then queue the jobs. Use **Test Telegram source** on one link to verify the channel, message, filename, size, and MIME type without downloading the movie. The dashboard shows active jobs and recent jobs separately, so refresh-safe actions like **Copy URL** and **Destroy** still work after the page reloads. Terminal jobs are pruned from recent history automatically after `WEB_RECENT_JOB_RETENTION_HOURS`.
 
 **Download only:** Check **Download only** to skip the worker/CDN handoff completely. Telebot now exposes the original downloaded file at a temporary URL without local prep/transcoding, so the URL keeps the real file extension and uses a normalized filename with no spaces in the path. The dashboard shows that URL directly and lets you copy it. Paste it into any tool that can fetch from URL, then click **Destroy** after the fetch is finished. If `TEMP_PUBLIC_URL` is set, telebot uses it; otherwise the web UI falls back to the current browser origin when building the visible temp URL. Forgotten download-only files are also cleaned up automatically after `TEMP_FILE_TTL_HOURS`.
 
@@ -274,7 +289,21 @@ Yes, with two conditions:
    - **Private channels:** Your account must be a member (you were added or joined via invite link).
 2. **The message at the link must contain a supported video file** (e.g. `.mp4`, `.mkv`). Text-only or photo-only posts won’t be processed.
 
-You don’t configure a fixed list of channels in the Web UI. You paste **any** valid `https://t.me/channelname/123` link; if your account can see that message and it has a video, it will be processed.
+You don’t configure a fixed list of channels in the Web UI. You can paste a public link, a private `/c/` link, or a topic link; if your account can see that message and it has a supported video/document, it will be processed. Ordinary membership is enough to read downloadable posts—Telegram admin access is not required.
+
+### API source inspection and direct-ID fallback
+
+`POST /api/inspect` resolves metadata without downloading. `POST /api/process` also accepts direct private-channel identifiers as an advanced fallback when a copied URL is unavailable:
+
+```json
+{
+  "telegram_chat_id": -1002489865945,
+  "telegram_message_id": 45517,
+  "telegram_topic_id": 10
+}
+```
+
+The same three fields are accepted by `/api/inspect`. A normal URL remains the preferred input.
 
 ## Process a single t.me link (CLI)
 
