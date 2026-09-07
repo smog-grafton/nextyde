@@ -70,6 +70,16 @@ def make_settings(temp_dir: Path) -> Settings:
         temp_file_ttl_hours=24,
         web_recent_job_retention_hours=24,
         worker_api_token=None,
+        telescope_enabled=False,
+        telescope_default_storage_target="auto",
+        telescope_max_active_jobs=4,
+        telescope_max_downloads_per_channel=2,
+        telescope_multipart_part_size_mb=32,
+        telescope_multipart_max_attempts=4,
+        telescope_upload_retry_base_ms=1000,
+        telescope_callback_url=None,
+        telescope_callback_secret=None,
+        telescope_callback_timeout_seconds=30,
     )
 
 

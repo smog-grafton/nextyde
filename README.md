@@ -42,6 +42,36 @@ Telebot normalizes every URL into a Telegram peer, message ID, and optional topi
 
 Private `/c/` links use the account's existing membership. Telebot converts the internal channel ID to the marked peer ID (for example, `2489865945` becomes `-1002489865945`) and refreshes the account's dialogs if Telethon's local entity cache is cold. It never auto-joins an invite link during an import.
 
+## Telescope direct object-storage imports
+
+Telescope is the fast, original-only path alongside the existing Tele-OB/NBX workflow:
+
+```text
+Portal -> Teletyde -> Telegram chunk iterator -> S3 multipart upload -> verify object -> signed Portal callback
+```
+
+It does not download the complete movie to local disk and does not involve NBX. Each active transfer uses bounded multipart working memory (32 MB parts by default, plus a temporary part copy and SDK/chunk overhead), independent of the movie's total size. The original container is preserved; Telescope does not claim to transcode MKV, generate HLS, compress, or create Fast Start MP4 output.
+
+The SQLite queue uses WAL mode and persists jobs, Telegram references, target/object identity, byte progress, multipart upload IDs and completed ETags. Interrupted transfers are returned to the queue on restart and continue from their last completed S3 part. Global direct-transfer concurrency defaults to four, with a separate per-channel limit of two. These limits do not change the legacy download or FFmpeg pools.
+
+In production, place `DB_PATH` on a persistent volume; otherwise a container replacement cannot recover the queue or multipart IDs.
+
+Enable it with `TELESCOPE_ENABLED=true`, configure one or more target blocks from `.env.example`, and set matching callback secrets:
+
+- Teletyde: `TELESCOPE_CALLBACK_URL` and `TELESCOPE_CALLBACK_SECRET`
+- Portal: `TELESCOPE_CALLBACK_SECRET`
+
+Portal submits only a logical target (`auto`, `contabo_nbx`, `contabo_nb_nbx`, or `r2_nbx`). All S3 credentials remain on Teletyde. Automatic selection follows the NBX convention: enabled/writable targets must have safe capacity, then the highest priority wins.
+
+Worker API:
+
+- `POST /api/worker/telescope/jobs` — persist and accept immediately with HTTP 202
+- `GET /api/worker/telescope/jobs/{job_id}` — status/polling fallback
+- `POST /api/worker/telescope/jobs/{job_id}/cancel`
+- `POST /api/worker/telescope/jobs/{job_id}/retry`
+
+The web dashboard exposes the same direct-storage choice and shows both legacy and Telescope jobs together.
+
 ## Deployment guides
 
 - [Same server with shared intake path](docs/deployment/01-same-server-path-copy.md)

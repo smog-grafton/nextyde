@@ -23,12 +23,14 @@ from app.link_parser import parse_telegram_reference
 from app.media_tools import detect_media_tools
 from app.temp_url import resolve_signed_temp_path
 from app.telegram_worker import JobCancelledError, TelegramPipeWorker
+from app.telescope import TelescopeScheduler
 
 LOG = logging.getLogger("telebot.web")
 jobs: dict[str, dict] = {}
 worker: TelegramPipeWorker | None = None
 app_settings: Settings | None = None
 authorized = False
+telescope_scheduler: TelescopeScheduler | None = None
 
 TERMINAL_STATUSES = {"done", "failed", "cancelled", "destroyed", "expired"}
 CANCELLABLE_STATUSES = {"queued", "resolving", "finding_message", "downloading", "waiting_to_prepare", "preparing", "uploading"}
@@ -261,7 +263,7 @@ def _require_worker_token(authorization: str | None) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global worker, authorized, app_settings
+    global worker, authorized, app_settings, telescope_scheduler
     try:
         settings = Settings.load()
         app_settings = settings
@@ -286,10 +288,21 @@ async def lifespan(app: FastAPI):
             if recovered:
                 LOG.info("Recovered %s download-only job(s) from temp storage", recovered)
             await worker.start_housekeeping(jobs)
+            if authorized and settings.telescope_enabled:
+                telescope_scheduler = TelescopeScheduler(worker, worker.store)
+                await telescope_scheduler.start()
+                LOG.info(
+                    "Telescope queue ready: %s global transfers, %s per Telegram channel",
+                    settings.telescope_max_active_jobs,
+                    settings.telescope_max_downloads_per_channel,
+                )
     except Exception as exc:
         LOG.exception("Startup failed: %s", exc)
         authorized = False
     yield
+    if telescope_scheduler:
+        await telescope_scheduler.stop()
+        telescope_scheduler = None
     if worker:
         await worker.stop()
 
@@ -313,6 +326,13 @@ class InspectRequest(BaseModel):
     telegram_chat_id: int | None = None
     telegram_message_id: int | None = None
     telegram_topic_id: int | None = None
+
+
+class TelescopeRequest(BaseModel):
+    link: str
+    storage_target: str = "auto"
+    portal_source_id: str | int | None = None
+    metadata: dict | None = None
 
 
 @app.post("/api/process")
@@ -394,6 +414,69 @@ async def api_inspect(req: InspectRequest):
         return await worker.inspect_link(normalized[0]["link"])
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(422, detail=_job_message(exc)) from exc
+
+
+def _public_telescope_job(job: dict) -> dict:
+    return {
+        key: value
+        for key, value in job.items()
+        if key not in {"multipart_upload_id", "multipart_parts", "metadata"}
+    }
+
+
+async def _submit_telescope(req: TelescopeRequest) -> dict:
+    if not telescope_scheduler or not worker or not authorized:
+        raise HTTPException(503, detail="Telescope is disabled or Telegram is not connected.")
+    try:
+        job = await telescope_scheduler.submit(
+            req.link,
+            storage_target=req.storage_target,
+            portal_source_id=req.portal_source_id,
+            metadata=req.metadata,
+        )
+    except (ValueError, RuntimeError) as exc:
+        raise HTTPException(422, detail=str(exc)) from exc
+    return {"accepted": True, "job_id": job["job_id"], "status": job["status"]}
+
+
+@app.post("/api/telescope/jobs", status_code=202)
+async def api_telescope_create_job(req: TelescopeRequest):
+    return await _submit_telescope(req)
+
+
+@app.get("/api/telescope/jobs")
+async def api_telescope_jobs(limit: int = 50):
+    if not worker:
+        raise HTTPException(503, detail="Telescope is unavailable.")
+    return [_public_telescope_job(job) for job in await worker.store.list_telescope_jobs(limit)]
+
+
+@app.get("/api/telescope/jobs/{job_id}")
+async def api_telescope_job_status(job_id: str):
+    if not worker:
+        raise HTTPException(503, detail="Telescope is unavailable.")
+    job = await worker.store.get_telescope_job(job_id)
+    if job is None:
+        raise HTTPException(404, detail="Telescope job not found.")
+    return _public_telescope_job(job)
+
+
+@app.post("/api/telescope/jobs/{job_id}/cancel")
+async def api_telescope_cancel(job_id: str):
+    if not telescope_scheduler:
+        raise HTTPException(503, detail="Telescope is unavailable.")
+    if not await telescope_scheduler.cancel(job_id):
+        raise HTTPException(409, detail="Telescope job is already terminal or was not found.")
+    return {"ok": True, "status": "cancellation_requested"}
+
+
+@app.post("/api/telescope/jobs/{job_id}/retry", status_code=202)
+async def api_telescope_retry(job_id: str):
+    if not telescope_scheduler:
+        raise HTTPException(503, detail="Telescope is unavailable.")
+    if not await telescope_scheduler.retry(job_id):
+        raise HTTPException(409, detail="Only failed or cancelled Telescope jobs can be retried.")
+    return {"accepted": True, "job_id": job_id, "status": "queued"}
 
 
 @app.get("/api/status")
@@ -553,6 +636,8 @@ async def api_worker_capacity(authorization: str | None = Header(default=None)):
         "max_concurrent_downloads": settings.max_concurrent_downloads,
         "handoff_mode": settings.cdn_handoff_mode,
         "stream_supported": True,
+        "telescope_enabled": bool(settings.telescope_enabled),
+        "telescope_max_active_jobs": settings.telescope_max_active_jobs,
     }
 
 
@@ -572,6 +657,42 @@ async def api_worker_job_status(job_id: str, authorization: str | None = Header(
 async def api_worker_destroy_job(job_id: str, authorization: str | None = Header(default=None)):
     _require_worker_token(authorization)
     return await api_destroy(job_id)
+
+
+@app.post("/api/worker/telescope/jobs", status_code=202)
+async def api_worker_telescope_create_job(
+    req: TelescopeRequest,
+    authorization: str | None = Header(default=None),
+):
+    _require_worker_token(authorization)
+    return await _submit_telescope(req)
+
+
+@app.get("/api/worker/telescope/jobs/{job_id}")
+async def api_worker_telescope_job_status(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+):
+    _require_worker_token(authorization)
+    return await api_telescope_job_status(job_id)
+
+
+@app.post("/api/worker/telescope/jobs/{job_id}/cancel")
+async def api_worker_telescope_cancel(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+):
+    _require_worker_token(authorization)
+    return await api_telescope_cancel(job_id)
+
+
+@app.post("/api/worker/telescope/jobs/{job_id}/retry", status_code=202)
+async def api_worker_telescope_retry(
+    job_id: str,
+    authorization: str | None = Header(default=None),
+):
+    _require_worker_token(authorization)
+    return await api_telescope_retry(job_id)
 
 
 @app.get("/health")
@@ -926,6 +1047,17 @@ def _html() -> str:
             <span>Download only. Fetch the Telegram file, expose a temporary URL in this UI, then wait for Destroy after your other tool finishes fetching it.</span>
           </label>
           <label class="checkbox-row">
+            <input type="checkbox" id="telescopeDirect" name="telescope_direct">
+            <span><strong>Telescope direct storage.</strong> Stream the original Telegram file straight into object storage without NBX or a full local copy.</span>
+          </label>
+          <label for="storageTarget"><strong>Telescope storage destination</strong></label>
+          <select id="storageTarget" name="storage_target">
+            <option value="auto">Automatic (recommended)</option>
+            <option value="contabo_nb_nbx">Contabo — nb-nbx</option>
+            <option value="contabo_nbx">Contabo — legacy nbx</option>
+            <option value="r2_nbx">Cloudflare R2 — nbx</option>
+          </select>
+          <label class="checkbox-row">
             <input type="checkbox" id="forceReimport" name="force">
             <span>Force re-import, even if these links were already processed before (use this if the original file was lost, e.g. after a redeploy, and needs refetching).</span>
           </label>
@@ -955,8 +1087,8 @@ def _html() -> str:
   </div>
 
   <script>
-    const TERMINAL_STATUSES = new Set(['done', 'failed', 'cancelled', 'destroyed', 'expired']);
-    const CANCELLABLE_STATUSES = new Set(['queued', 'resolving', 'finding_message', 'downloading', 'waiting_to_prepare', 'preparing', 'uploading']);
+    const TERMINAL_STATUSES = new Set(['done', 'ready', 'failed', 'cancelled', 'destroyed', 'expired']);
+    const CANCELLABLE_STATUSES = new Set(['queued', 'resolving', 'finding_message', 'waiting_for_slot', 'transferring', 'downloading', 'waiting_to_prepare', 'preparing', 'uploading']);
     const form = document.getElementById('form');
     const linksInput = document.getElementById('linksInput');
     const submitBtn = document.getElementById('submitBtn');
@@ -1003,6 +1135,7 @@ def _html() -> str:
 
     function badgeClass(status) {
       if (status === 'done') return 'badge done';
+      if (status === 'ready') return 'badge done';
       if (status === 'downloaded') return 'badge downloaded';
       if (status === 'failed') return 'badge failed';
       if (status === 'cancelled' || status === 'destroyed' || status === 'expired') return 'badge ' + status;
@@ -1031,7 +1164,7 @@ def _html() -> str:
       const resolvedTempUrl = job.temp_url ? toAbsoluteUrl(job.temp_url) : '';
       let actions = '';
       if (CANCELLABLE_STATUSES.has(job.status)) {
-        actions += '<button type="button" class="btn-danger" data-action="cancel" data-job-id="' + escapeHtml(job.job_id) + '">Cancel</button>';
+        actions += '<button type="button" class="btn-danger" data-action="cancel" data-job-id="' + escapeHtml(job.job_id) + '" data-telescope="' + (job.delivery_mode === 'telescope' ? '1' : '0') + '">Cancel</button>';
       }
       if (resolvedTempUrl && job.temp_path && job.status !== 'destroyed' && job.status !== 'expired') {
         actions += '<button type="button" class="btn-secondary" data-action="copy-temp-url" data-temp-url="' + escapeHtml(resolvedTempUrl) + '">Copy URL</button>';
@@ -1042,10 +1175,16 @@ def _html() -> str:
       if (job.duplicate && job.link) {
         actions += '<button type="button" class="btn-secondary" data-action="force-reimport" data-link="' + escapeHtml(job.link) + '">Force re-import</button>';
       }
+      if (job.delivery_mode === 'telescope' && (job.status === 'failed' || job.status === 'cancelled')) {
+        actions += '<button type="button" class="btn-secondary" data-action="retry-telescope" data-job-id="' + escapeHtml(job.job_id) + '">Retry Telescope</button>';
+      }
 
       let tempUrlPanel = '';
       if (resolvedTempUrl && job.temp_path) {
         tempUrlPanel = '<div class="temp-url"><strong>Temp URL</strong><br><a href="' + escapeHtml(resolvedTempUrl) + '" target="_blank" rel="noreferrer">' + escapeHtml(resolvedTempUrl) + '</a></div>';
+      }
+      if (job.object_url) {
+        tempUrlPanel = '<div class="temp-url"><strong>Object URL</strong><br><a href="' + escapeHtml(job.object_url) + '" target="_blank" rel="noreferrer">' + escapeHtml(job.object_url) + '</a></div>';
       }
 
       const progress = TERMINAL_STATUSES.has(job.status) && job.status !== 'downloaded'
@@ -1055,6 +1194,7 @@ def _html() -> str:
       const meta = []
         .concat(job.download_only ? ['download only'] : [])
         .concat(job.file_name ? [job.file_name] : [])
+        .concat(job.storage_target ? [job.storage_target] : [])
         .concat(job.updated_ts ? ['updated ' + new Date(job.updated_ts * 1000).toLocaleTimeString()] : []);
 
       return ''
@@ -1092,7 +1232,21 @@ def _html() -> str:
 
     async function refreshJobs() {
       try {
-        const list = await apiJson('/api/jobs?limit=50');
+        const responses = await Promise.all([
+          apiJson('/api/jobs?limit=50'),
+          apiJson('/api/telescope/jobs?limit=50')
+        ]);
+        const telescope = responses[1].map((job) => ({
+          ...job,
+          delivery_mode: 'telescope',
+          link: job.telegram_url,
+          progress_pct: job.progress,
+          object_url: job.result && job.result.public_url,
+          message: job.status === 'transferring'
+            ? 'Streaming directly to object storage: ' + Number(job.progress || 0) + '%'
+            : (job.last_error || String(job.status || '').replaceAll('_', ' '))
+        }));
+        const list = responses[0].concat(telescope).sort((a, b) => Number(b.updated_at || b.updated_ts || 0) - Number(a.updated_at || a.updated_ts || 0));
         const active = list.filter((job) => !TERMINAL_STATUSES.has(job.status));
         const recent = list.filter((job) => TERMINAL_STATUSES.has(job.status));
         activeCountEl.textContent = active.length + ' active';
@@ -1119,11 +1273,25 @@ def _html() -> str:
 
       if (target.dataset.action === 'cancel' && target.dataset.jobId) {
         try {
-          await apiJson('/api/cancel?job_id=' + encodeURIComponent(target.dataset.jobId), { method: 'POST' });
+          const cancelUrl = target.dataset.telescope === '1'
+            ? '/api/telescope/jobs/' + encodeURIComponent(target.dataset.jobId) + '/cancel'
+            : '/api/cancel?job_id=' + encodeURIComponent(target.dataset.jobId);
+          await apiJson(cancelUrl, { method: 'POST' });
           showNotice('Cancellation requested.', 'ok');
           await refreshJobs();
         } catch (error) {
           showNotice(error.message || 'Cancel failed.', 'error');
+        }
+        return;
+      }
+
+      if (target.dataset.action === 'retry-telescope' && target.dataset.jobId) {
+        try {
+          await apiJson('/api/telescope/jobs/' + encodeURIComponent(target.dataset.jobId) + '/retry', { method: 'POST' });
+          showNotice('Telescope retry queued.', 'ok');
+          await refreshJobs();
+        } catch (error) {
+          showNotice(error.message || 'Telescope retry failed.', 'error');
         }
         return;
       }
@@ -1168,6 +1336,18 @@ def _html() -> str:
       submitBtn.disabled = true;
       showNotice('Submitting jobs…', 'ok');
       try {
+        if (document.getElementById('telescopeDirect').checked) {
+          const target = document.getElementById('storageTarget').value;
+          await Promise.all(links.map((link) => apiJson('/api/telescope/jobs', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ link: link, storage_target: target })
+          })));
+          showNotice('Queued ' + links.length + ' durable Telescope job' + (links.length === 1 ? '' : 's') + '.', 'ok');
+          linksInput.value = '';
+          await refreshJobs();
+          return;
+        }
         const payload = {
           links: links,
           download_only: document.getElementById('downloadOnly').checked,
@@ -1213,6 +1393,13 @@ def _html() -> str:
       } finally {
         inspectBtn.disabled = false;
       }
+    });
+
+    document.getElementById('telescopeDirect').addEventListener('change', (event) => {
+      if (event.target.checked) document.getElementById('downloadOnly').checked = false;
+    });
+    document.getElementById('downloadOnly').addEventListener('change', (event) => {
+      if (event.target.checked) document.getElementById('telescopeDirect').checked = false;
     });
 
     refreshHealth();

@@ -89,6 +89,16 @@ class Settings:
     temp_file_ttl_hours: int
     web_recent_job_retention_hours: int
     worker_api_token: str | None
+    telescope_enabled: bool
+    telescope_default_storage_target: str
+    telescope_max_active_jobs: int
+    telescope_max_downloads_per_channel: int
+    telescope_multipart_part_size_mb: int
+    telescope_multipart_max_attempts: int
+    telescope_upload_retry_base_ms: int
+    telescope_callback_url: str | None
+    telescope_callback_secret: str | None
+    telescope_callback_timeout_seconds: int
 
     def should_prepare_video_locally(self, *, download_only: bool = False) -> bool:
         if download_only:
@@ -107,6 +117,7 @@ class Settings:
         handoff_mode = os.getenv("CDN_HANDOFF_MODE", "upload").strip().lower() or "upload"
         temp_public_url = os.getenv("TEMP_PUBLIC_URL", "").strip()
         temp_url_secret = (os.getenv("TEMP_URL_SECRET") or os.getenv("CDN_API_TOKEN") or "").strip()
+        telescope_enabled = _bool("TELESCOPE_ENABLED", False)
 
         missing = []
         if not api_id:
@@ -115,7 +126,7 @@ class Settings:
             missing.append("TG_API_HASH")
         if not tg_phone:
             missing.append("TG_PHONE")
-        if not download_only and not cdn_upload_url:
+        if not download_only and not cdn_upload_url and not telescope_enabled:
             missing.append("CDN_UPLOAD_URL")
         if handoff_mode == "source_url" and not temp_public_url:
             missing.append("TEMP_PUBLIC_URL")
@@ -184,4 +195,31 @@ class Settings:
             temp_file_ttl_hours=max(1, int(os.getenv("TEMP_FILE_TTL_HOURS", "24"))),
             web_recent_job_retention_hours=max(1, int(os.getenv("WEB_RECENT_JOB_RETENTION_HOURS", "24"))),
             worker_api_token=(os.getenv("WORKER_API_TOKEN") or "").strip() or None,
+            telescope_enabled=telescope_enabled,
+            telescope_default_storage_target=(
+                os.getenv("TELESCOPE_DEFAULT_STORAGE_TARGET", "auto").strip() or "auto"
+            ),
+            telescope_max_active_jobs=max(1, int(os.getenv("TELESCOPE_MAX_ACTIVE_JOBS", "4"))),
+            telescope_max_downloads_per_channel=max(
+                1,
+                int(os.getenv("TELESCOPE_MAX_DOWNLOADS_PER_CHANNEL", "2")),
+            ),
+            telescope_multipart_part_size_mb=max(
+                5,
+                int(os.getenv("TELESCOPE_MULTIPART_PART_SIZE_MB", "32")),
+            ),
+            telescope_multipart_max_attempts=max(
+                1,
+                int(os.getenv("TELESCOPE_MULTIPART_MAX_ATTEMPTS", "4")),
+            ),
+            telescope_upload_retry_base_ms=max(
+                100,
+                int(os.getenv("TELESCOPE_UPLOAD_RETRY_BASE_MS", "1000")),
+            ),
+            telescope_callback_url=(os.getenv("TELESCOPE_CALLBACK_URL") or "").strip() or None,
+            telescope_callback_secret=(os.getenv("TELESCOPE_CALLBACK_SECRET") or "").strip() or None,
+            telescope_callback_timeout_seconds=max(
+                5,
+                int(os.getenv("TELESCOPE_CALLBACK_TIMEOUT_SECONDS", "30")),
+            ),
         )
