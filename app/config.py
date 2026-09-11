@@ -102,6 +102,18 @@ class Settings:
     telescope_callback_url: str | None
     telescope_callback_secret: str | None
     telescope_callback_timeout_seconds: int
+    telescope_max_downloads: int = 2
+    telescope_max_uploads: int = 2
+    telescope_max_media_jobs: int = 1
+    telescope_max_remux_jobs: int = 2
+    telescope_max_inspections: int = 2
+    telescope_disk_reserve_mb: int = 2048
+    telescope_disk_expansion_factor: float = 3.0
+    telescope_failed_retention_hours: int = 72
+    telescope_progress_interval_seconds: float = 3.0
+    handbrake_binary: str | None = None
+    media_encode_threads: int = 2
+    media_process_nice: int = 10
 
     def should_prepare_video_locally(self, *, download_only: bool = False) -> bool:
         if download_only:
@@ -237,4 +249,16 @@ class Settings:
                 5,
                 int(os.getenv("TELESCOPE_CALLBACK_TIMEOUT_SECONDS", "30")),
             ),
+            telescope_max_downloads=max(1, int(os.getenv("TELESCOPE_MAX_DOWNLOADS", "2"))),
+            telescope_max_uploads=max(1, int(os.getenv("TELESCOPE_MAX_UPLOADS", "2"))),
+            telescope_max_media_jobs=max(1, int(os.getenv("TELESCOPE_MAX_MEDIA_JOBS", "1"))),
+            telescope_max_remux_jobs=max(1, int(os.getenv("TELESCOPE_MAX_REMUX_JOBS", "2"))),
+            telescope_max_inspections=max(1, int(os.getenv("TELESCOPE_MAX_INSPECTIONS", "2"))),
+            telescope_disk_reserve_mb=max(128, int(os.getenv("TELESCOPE_DISK_RESERVE_MB", "2048"))),
+            telescope_disk_expansion_factor=max(2.0, float(os.getenv("TELESCOPE_DISK_EXPANSION_FACTOR", "3.0"))),
+            telescope_failed_retention_hours=max(1, int(os.getenv("TELESCOPE_FAILED_RETENTION_HOURS", "72"))),
+            telescope_progress_interval_seconds=max(1.0, float(os.getenv("TELESCOPE_PROGRESS_INTERVAL_SECONDS", "3"))),
+            handbrake_binary=(os.getenv("HANDBRAKE_BINARY") or "").strip() or None,
+            media_encode_threads=max(1, int(os.getenv("MEDIA_ENCODE_THREADS", "2"))),
+            media_process_nice=min(19, max(0, int(os.getenv("MEDIA_PROCESS_NICE", "10")))),
         )

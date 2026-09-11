@@ -1,4 +1,4 @@
-FROM python:3.12-slim
+FROM python:3.12-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
@@ -9,8 +9,14 @@ WORKDIR /app
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     ffmpeg \
+    handbrake-cli \
     openssl \
     && rm -rf /var/lib/apt/lists/*
+
+# Fail the image build if its media dependencies cannot execute. Profiles use
+# explicit, whitelisted settings rather than version-dependent preset names.
+RUN ffmpeg -version && ffprobe -version && HandBrakeCLI --version \
+    && HandBrakeCLI --preset-list
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

@@ -24,7 +24,7 @@ def make_settings(temp_dir: Path) -> Settings:
         tg_api_id=1,
         tg_api_hash="hash",
         tg_phone="+256700000000",
-        tg_session_name="session",
+        tg_session_name=str(temp_dir / "session"),
         tg_2fa_password=None,
         tg_login_code=None,
         tg_watch_targets=[],
@@ -379,15 +379,15 @@ class VideoPrepAnalysisTests(unittest.TestCase):
         self.assertFalse(settings.should_prepare_video_locally())
         self.assertFalse(settings.should_prepare_video_locally(download_only=True))
 
-    def test_analyze_video_for_delivery_builds_capped_attempts(self) -> None:
+    def test_analyze_large_compatible_mkv_uses_remux_without_size_cap(self) -> None:
         source_probe = MediaProbeResult(
             path=Path("/tmp/movie.mkv"),
             extension=".mkv",
             size_bytes=2_700 * 1024 * 1024,
             duration_seconds=7200.0,
             container_format="matroska,webm",
-            video=VideoStreamInfo(codec="hevc", width=1920, height=1080, pix_fmt="yuv420p", frame_rate=23.976),
-            audio=AudioStreamInfo(codec="aac", channels=2, sample_rate=48000),
+            video=VideoStreamInfo(codec="h264", width=1920, height=1080, pix_fmt="yuv420p", frame_rate=23.976, profile="High", level=41),
+            audio=AudioStreamInfo(codec="aac", channels=2, sample_rate=48000, profile="LC"),
         )
         settings = make_settings(Path("/tmp/telebot-tests"))
 
@@ -396,11 +396,9 @@ class VideoPrepAnalysisTests(unittest.TestCase):
                 analysis = analyze_video_for_delivery(settings, source_probe.path)
 
         self.assertTrue(analysis.decision.should_transcode)
-        self.assertEqual(analysis.decision.mode, "cap")
-        self.assertEqual(len(analysis.attempts), 3)
-        self.assertEqual([attempt.target_height for attempt in analysis.attempts], [480, 360, 360])
-        self.assertGreater(analysis.attempts[0].video_bitrate_kbps, analysis.attempts[1].video_bitrate_kbps)
-        self.assertGreater(analysis.attempts[1].video_bitrate_kbps, analysis.attempts[2].video_bitrate_kbps)
+        self.assertEqual(analysis.decision.mode, "remux")
+        self.assertFalse(analysis.decision.enforce_size_cap)
+        self.assertEqual(analysis.attempts, ())
 
 
 class TelegramWorkerBehaviorTests(unittest.IsolatedAsyncioTestCase):
@@ -410,6 +408,7 @@ class TelegramWorkerBehaviorTests(unittest.IsolatedAsyncioTestCase):
             settings.video_prep_enabled = True
 
             worker = TelegramPipeWorker(settings)
+            self.addCleanup(worker.client.session.close)
             await worker.cdn.close()
             worker.store = SimpleNamespace(
                 is_processed=AsyncMock(return_value=False),
@@ -468,6 +467,7 @@ class TelegramWorkerBehaviorTests(unittest.IsolatedAsyncioTestCase):
             settings.video_prep_enabled = True
 
             worker = TelegramPipeWorker(settings)
+            self.addCleanup(worker.client.session.close)
             await worker.cdn.close()
             worker.store = SimpleNamespace(
                 is_processed=AsyncMock(return_value=False),
@@ -519,6 +519,7 @@ class TelegramWorkerBehaviorTests(unittest.IsolatedAsyncioTestCase):
             settings.video_prep_enabled = True
 
             worker = TelegramPipeWorker(settings)
+            self.addCleanup(worker.client.session.close)
             await worker.cdn.close()
             worker.store = SimpleNamespace(
                 is_processed=AsyncMock(return_value=False),

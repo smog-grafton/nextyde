@@ -1,0 +1,28 @@
+services:
+  teletyde:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: narabox-teletyde:local
+    restart: unless-stopped
+    init: true
+    command: ["python", "-m", "app.web"]
+    env_file: ../.env
+    environment:
+      TG_SESSION_NAME: /data/narabox_telebot
+      DB_PATH: /data/telebot_state.db
+      TEMP_DIR: /data/temp
+      PORT: "8765"
+      TELESCOPE_ENABLED: "true"
+      WEB_DISABLE_TELEGRAM: "false"
+    volumes:
+      - teletyde-data:/data
+    ports:
+      - "127.0.0.1:8765:8765"
+    cpus: "${TELETYDE_CPU_LIMIT:-2.0}"
+    mem_limit: "${TELETYDE_MEMORY_LIMIT:-3g}"
+    pids_limit: 256
+    stop_grace_period: 60s
+
+volumes:
+  teletyde-data:

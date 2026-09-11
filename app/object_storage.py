@@ -10,6 +10,7 @@ from urllib.parse import quote
 
 import boto3
 from botocore.client import Config
+from botocore.exceptions import ClientError
 
 
 ProgressCallback = Callable[[int, int, str, list[dict[str, Any]]], Awaitable[None]]
@@ -129,6 +130,30 @@ def load_storage_targets() -> dict[str, ObjectStorageTarget]:
 class ObjectStorageManager:
     def __init__(self, targets: dict[str, ObjectStorageTarget] | None = None) -> None:
         self.targets = targets if targets is not None else load_storage_targets()
+        self._reservations: dict[str, tuple[str, int]] = {}
+        self._committed: dict[str, int] = {}
+
+    def reserve(self, job_id: str, requested: str | None, expected_bytes: int) -> ObjectStorageTarget:
+        """Account for this process's concurrent uploads in configured capacity."""
+        prior = self._reservations.pop(job_id, None)
+        try:
+            target = self.resolve(requested, expected_bytes)
+            self._reservations[job_id] = (target.key, expected_bytes)
+            return target
+        except Exception:
+            if prior:
+                self._reservations[job_id] = prior
+            raise
+
+    def release(self, job_id: str, *, committed: bool = False) -> None:
+        reserved = self._reservations.pop(job_id, None)
+        if committed and reserved:
+            key, size = reserved
+            self._committed[key] = self._committed.get(key, 0) + size
+
+    def _available(self, target: ObjectStorageTarget, expected_bytes: int) -> bool:
+        in_flight = sum(size for key, size in self._reservations.values() if key == target.key)
+        return target.has_safe_capacity_for(expected_bytes + in_flight + self._committed.get(target.key, 0))
 
     def resolve(self, requested: str | None, expected_bytes: int) -> ObjectStorageTarget:
         key = (requested or "auto").strip().lower()
@@ -139,12 +164,14 @@ class ObjectStorageManager:
             if target is None:
                 raise RuntimeError(f"Unknown Telescope storage target: {key}")
             self._assert_usable(target, expected_bytes)
+            if not self._available(target, expected_bytes):
+                raise RuntimeError(f"Telescope storage target [{key}] has insufficient safe capacity after active uploads.")
             return target
 
         candidates = [
             target
             for target in self.targets.values()
-            if target.configured and target.has_safe_capacity_for(expected_bytes)
+            if target.configured and self._available(target, expected_bytes)
         ]
         if not candidates:
             raise RuntimeError(
@@ -167,6 +194,16 @@ class ObjectStorageManager:
     @staticmethod
     def build_object_key(target: ObjectStorageTarget, job_id: str, file_name: str, date_path: str) -> str:
         return str(PurePosixPath(target.path_prefix) / "telescope" / date_path / job_id / file_name)
+
+
+async def _s3_call(function, *args, **kwargs):
+    """Do not release a job's ownership while a boto3 thread still mutates S3."""
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.gather(task, return_exceptions=True)
+        raise
 
 
 class S3MultipartUploader:
@@ -200,7 +237,7 @@ class S3MultipartUploader:
             self.target.bucket,
             object_key,
         )
-        response = await asyncio.to_thread(
+        response = await _s3_call(
             self.client.create_multipart_upload,
             Bucket=self.target.bucket,
             Key=object_key,
@@ -294,7 +331,7 @@ class S3MultipartUploader:
         if verify_callback:
             await verify_callback()
         try:
-            await asyncio.to_thread(
+            await _s3_call(
                 self.client.complete_multipart_upload,
                 Bucket=self.target.bucket,
                 Key=object_key,
@@ -320,14 +357,18 @@ class S3MultipartUploader:
         missing_ok: bool = False,
     ) -> dict[str, Any] | None:
         try:
-            head = await asyncio.to_thread(self.client.head_object, Bucket=self.target.bucket, Key=object_key)
-        except Exception:
-            if missing_ok:
+            head = await _s3_call(self.client.head_object, Bucket=self.target.bucket, Key=object_key)
+        except ClientError as exc:
+            if missing_ok and str(exc.response.get("Error", {}).get("Code")) in {"404", "NoSuchKey", "NotFound"}:
                 return None
             raise
         stored_bytes = int(head.get("ContentLength") or 0)
         if stored_bytes != total_bytes:
             raise RuntimeError(f"Stored object verification failed: expected {total_bytes} bytes, found {stored_bytes}.")
+        if head.get("ContentEncoding"):
+            raise RuntimeError("Stored video has an unexpected Content-Encoding.")
+        if mime_type == "video/mp4" and head.get("ContentType") != "video/mp4":
+            raise RuntimeError("Stored MP4 has an incorrect Content-Type.")
         return {
             "storage_target": self.target.key,
             "provider": self.target.provider,
@@ -359,7 +400,7 @@ class S3MultipartUploader:
                     attempt,
                     self.max_attempts,
                 )
-                response = await asyncio.to_thread(
+                response = await _s3_call(
                     self.client.upload_part,
                     Bucket=self.target.bucket,
                     Key=object_key,
@@ -382,7 +423,7 @@ class S3MultipartUploader:
         raise RuntimeError(f"S3 multipart part {part_number} failed after {self.max_attempts} attempts") from last_error
 
     async def abort(self, object_key: str, upload_id: str) -> None:
-        await asyncio.to_thread(
+        await _s3_call(
             self.client.abort_multipart_upload,
             Bucket=self.target.bucket,
             Key=object_key,

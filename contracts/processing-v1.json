@@ -1,0 +1,146 @@
+{
+  "version": 1,
+  "examples": [
+    {
+      "input": {
+        "mode": "auto"
+      },
+      "expected": {
+        "mode": "auto",
+        "target_height": null,
+        "rf": 23,
+        "max_frame_rate": null,
+        "fast_start": true,
+        "encoder_preset": "veryfast",
+        "require_compatible": true,
+        "audio_stream_index": null
+      }
+    },
+    {
+      "input": {
+        "mode": "fast_mp4"
+      },
+      "expected": {
+        "mode": "fast_mp4",
+        "target_height": null,
+        "rf": 23,
+        "max_frame_rate": null,
+        "fast_start": true,
+        "encoder_preset": "veryfast",
+        "require_compatible": true,
+        "audio_stream_index": null
+      }
+    },
+    {
+      "input": {
+        "mode": "720p_balanced"
+      },
+      "expected": {
+        "mode": "720p_balanced",
+        "target_height": 720,
+        "rf": 23,
+        "max_frame_rate": 30,
+        "fast_start": true,
+        "encoder_preset": "veryfast",
+        "require_compatible": true,
+        "audio_stream_index": null
+      }
+    },
+    {
+      "input": {
+        "mode": "720p_compact"
+      },
+      "expected": {
+        "mode": "720p_compact",
+        "target_height": 720,
+        "rf": 26,
+        "max_frame_rate": 30,
+        "fast_start": true,
+        "encoder_preset": "veryfast",
+        "require_compatible": true,
+        "audio_stream_index": null
+      }
+    },
+    {
+      "input": {
+        "mode": "720p_extra_compact"
+      },
+      "expected": {
+        "mode": "720p_extra_compact",
+        "target_height": 720,
+        "rf": 27,
+        "max_frame_rate": 30,
+        "fast_start": true,
+        "encoder_preset": "veryfast",
+        "require_compatible": true,
+        "audio_stream_index": null
+      }
+    },
+    {
+      "input": {
+        "mode": "1080p_balanced"
+      },
+      "expected": {
+        "mode": "1080p_balanced",
+        "target_height": 1080,
+        "rf": 23,
+        "max_frame_rate": 30,
+        "fast_start": true,
+        "encoder_preset": "veryfast",
+        "require_compatible": true,
+        "audio_stream_index": null
+      }
+    },
+    {
+      "input": {
+        "mode": "keep_original"
+      },
+      "expected": {
+        "mode": "keep_original",
+        "target_height": null,
+        "rf": 23,
+        "max_frame_rate": null,
+        "fast_start": false,
+        "encoder_preset": "veryfast",
+        "require_compatible": false,
+        "audio_stream_index": null
+      }
+    },
+    {
+      "input": {
+        "mode": "custom"
+      },
+      "expected": {
+        "mode": "custom",
+        "target_height": null,
+        "rf": 23,
+        "max_frame_rate": null,
+        "fast_start": true,
+        "encoder_preset": "veryfast",
+        "require_compatible": true,
+        "audio_stream_index": null
+      }
+    },
+    {
+      "input": {
+        "mode": "custom",
+        "target_height": 480,
+        "rf": 27,
+        "max_frame_rate": 25,
+        "encoder_preset": "fast",
+        "fast_start": false,
+        "audio_stream_index": 2
+      },
+      "expected": {
+        "mode": "custom",
+        "target_height": 480,
+        "rf": 27,
+        "max_frame_rate": 25,
+        "fast_start": false,
+        "encoder_preset": "fast",
+        "require_compatible": true,
+        "audio_stream_index": 2
+      }
+    }
+  ]
+}

@@ -234,34 +234,20 @@ class TelescopeStateStoreTests(unittest.IsolatedAsyncioTestCase):
                 return None
 
         temp_dir, store, scheduler = await self._transfer_fixture(OneChunkStream())
-        observed = {}
-
-        class InspectingUploader:
-            async def upload(self, chunks, **kwargs):
-                iterator = chunks.__aiter__()
-                await iterator.__anext__()
-                observed.update(await store.get_telescope_job("transfer-job"))
-                await iterator.aclose()
-                return {
-                    "storage_target": "demo",
-                    "bucket": "movies",
-                    "object_key": "videos/movie.mp4",
-                    "public_url": "https://cdn.example/videos/movie.mp4",
-                    "bytes": 20 * 1024 * 1024,
-                }
-
         try:
-            with patch("app.telescope.telethon_utils.get_input_location", return_value=(1, object())), patch(
-                "app.telescope.S3MultipartUploader", return_value=InspectingUploader()
-            ):
-                await scheduler._transfer(
-                    "transfer-job",
-                    scheduler._reference_from_job(await store.get_telescope_job("transfer-job")),
-                    asyncio.Event(),
-                )
+            with patch("app.telescope.telethon_utils.get_input_location", return_value=(1, object())):
+                with self.assertRaisesRegex(TelescopeTransferStalledError, "incomplete"):
+                    await scheduler._transfer(
+                        "transfer-job",
+                        scheduler._reference_from_job(await store.get_telescope_job("transfer-job")),
+                        asyncio.Event(),
+                    )
+            observed = await store.get_telescope_job("transfer-job")
             self.assertEqual(observed["bytes_transferred"], 0)
             self.assertEqual(observed["metadata"]["streamed_bytes"], 512 * 1024)
-            self.assertGreater(observed["progress"], 0)
+            self.assertGreater(observed["metadata"]["stage_progress"], 0)
+            self.assertFalse((scheduler._job_dir("transfer-job") / "source.media").exists())
+            self.assertEqual((scheduler._job_dir("transfer-job") / "input.part").stat().st_size, 512 * 1024)
         finally:
             await scheduler._http.aclose()
             temp_dir.cleanup()
@@ -363,58 +349,47 @@ class TelescopeStateStoreTests(unittest.IsolatedAsyncioTestCase):
             finally:
                 await scheduler._http.aclose()
 
-    async def test_scheduler_enforces_four_global_and_two_per_channel(self) -> None:
-        with tempfile.TemporaryDirectory() as temp_dir:
-            store = StateStore(str(Path(temp_dir) / "state.db"))
+    async def test_scheduler_bounds_active_jobs_while_network_and_media_have_separate_slots(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = StateStore(str(Path(directory) / "state.db"))
             await store.init()
-            settings = SimpleNamespace(
-                telescope_enabled=True,
-                telescope_default_storage_target="auto",
-                telescope_max_active_jobs=4,
-                telescope_max_downloads_per_channel=2,
-                telescope_callback_timeout_seconds=5,
-                telescope_callback_url=None,
-                telescope_callback_secret=None,
-                telescope_job_max_attempts=3,
-                telescope_retry_delay_seconds=0,
-            )
+            from test_web_and_video import make_settings
+            settings = make_settings(Path(directory))
+            settings.telescope_enabled = True
             scheduler = TelescopeScheduler(SimpleNamespace(settings=settings), store)
-            for channel in ("channel_a", "channel_b"):
-                for message_id in range(1, 5):
-                    await scheduler.submit(f"https://t.me/{channel}/{message_id}")
+            for index in range(8):
+                await scheduler.submit(f"https://t.me/demo/{index + 1}")
+            active, maximum, completed = 0, 0, 0
+            first_batch = asyncio.Event()
+            release = asyncio.Event()
+            done = asyncio.Event()
 
-            active_global = 0
-            active_by_channel = {"channel_a": 0, "channel_b": 0}
-            maximum_global = 0
-            maximum_by_channel = {"channel_a": 0, "channel_b": 0}
-            completed = 0
-            all_completed = asyncio.Event()
-
-            async def fake_transfer(job_id, reference, cancel_event):
-                nonlocal active_global, maximum_global, completed
-                channel = str(reference.username)
-                active_global += 1
-                active_by_channel[channel] += 1
-                maximum_global = max(maximum_global, active_global)
-                maximum_by_channel[channel] = max(maximum_by_channel[channel], active_by_channel[channel])
-                try:
-                    await asyncio.sleep(0.03)
-                finally:
-                    active_by_channel[channel] -= 1
-                    active_global -= 1
-                    completed += 1
-                    if completed == 8:
-                        all_completed.set()
+            async def fake_transfer(job_id, reference, cancel_event, **kwargs):
+                nonlocal active, maximum, completed
+                active += 1
+                maximum = max(maximum, active)
+                if active == 4:
+                    first_batch.set()
+                await release.wait()
+                active -= 1
+                completed += 1
+                await store.update_telescope_job(job_id, status="ready")
+                if completed == 8:
+                    done.set()
 
             scheduler._transfer = fake_transfer
             await scheduler.start()
             try:
-                await asyncio.wait_for(all_completed.wait(), timeout=3)
+                await asyncio.wait_for(first_batch.wait(), 5)
+                self.assertEqual(maximum, 4)
+                self.assertIsNot(scheduler._download_sem, scheduler._media_sem)
+                self.assertIsNot(scheduler._upload_sem, scheduler._media_sem)
+                release.set()
+                await asyncio.wait_for(done.wait(), 5)
             finally:
+                release.set()
                 await scheduler.stop()
-
-            self.assertEqual(maximum_global, 4)
-            self.assertEqual(maximum_by_channel, {"channel_a": 2, "channel_b": 2})
+            self.assertEqual(maximum, 4)
 
     async def test_stalled_job_retries_then_becomes_failed_at_attempt_limit(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

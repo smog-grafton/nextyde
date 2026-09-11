@@ -87,6 +87,9 @@ TELESCOPE_JOB_COLUMNS = {
     "started_at",
     "updated_at",
     "completed_at",
+    "processing_json",
+    "checkpoint_json",
+    "processing_result_json",
 }
 
 
@@ -99,6 +102,12 @@ class StateStore:
             await db.execute("PRAGMA journal_mode=WAL")
             await db.execute("PRAGMA foreign_keys=ON")
             await db.executescript(SCHEMA)
+            # Additive migration for installations with existing resumable jobs.
+            cursor = await db.execute("PRAGMA table_info(telescope_jobs)")
+            columns = {row[1] for row in await cursor.fetchall()}
+            for column in ("processing_json", "checkpoint_json", "processing_result_json"):
+                if column not in columns:
+                    await db.execute(f"ALTER TABLE telescope_jobs ADD COLUMN {column} TEXT NOT NULL DEFAULT '{{}}'")
             await db.commit()
 
     async def is_processed(self, chat_id: int, message_id: int) -> bool:
@@ -152,11 +161,11 @@ class StateStore:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
                 """
-                INSERT INTO telescope_jobs (
+                INSERT OR IGNORE INTO telescope_jobs (
                     job_id, telegram_url, reference_json, portal_source_id,
                     storage_target_requested, status, metadata_json,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?)
+                    created_at, updated_at, processing_json
+                ) VALUES (?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?)
                 """,
                 (
                     job["job_id"],
@@ -167,6 +176,7 @@ class StateStore:
                     json.dumps(job.get("metadata") or {}, separators=(",", ":")),
                     now,
                     now,
+                    json.dumps(job.get("processing") or {}, separators=(",", ":")),
                 ),
             )
             await db.commit()
@@ -192,6 +202,13 @@ class StateStore:
             )
             rows = await cursor.fetchall()
             await cursor.close()
+        return [self._decode_telescope_job(dict(row)) for row in rows]
+
+    async def terminal_telescope_jobs(self) -> list[dict[str, Any]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM telescope_jobs WHERE status IN ('ready', 'failed', 'cancelled')")
+            rows = await cursor.fetchall()
         return [self._decode_telescope_job(dict(row)) for row in rows]
 
     async def next_queued_telescope_jobs(self, limit: int) -> list[dict[str, Any]]:
@@ -259,9 +276,10 @@ class StateStore:
 
     async def recover_telescope_jobs(self) -> int:
         async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("UPDATE telescope_jobs SET status = 'cancelled', completed_at = ?, updated_at = ? WHERE cancel_requested = 1 AND status NOT IN ('ready', 'failed', 'cancelled')", (time.time(), time.time()))
             cursor = await db.execute(
                 "UPDATE telescope_jobs SET status = 'queued', updated_at = ? "
-                "WHERE status IN ('resolving', 'waiting_for_slot', 'transferring', 'uploading', 'verifying', 'retrying')",
+                "WHERE status NOT IN ('queued', 'ready', 'failed', 'cancelled')",
                 (time.time(),),
             )
             await db.commit()
@@ -314,7 +332,7 @@ class StateStore:
             )
             if event_type == "ready":
                 await db.execute(
-                    "UPDATE telescope_jobs SET status = 'ready', callback_status = 'delivered', completed_at = ?, updated_at = ? WHERE job_id = ?",
+                    "UPDATE telescope_jobs SET callback_status = 'delivered', completed_at = ?, updated_at = ? WHERE job_id = ? AND status = 'ready'",
                     (now, now, job_id),
                 )
             await db.commit()
@@ -334,7 +352,7 @@ class StateStore:
 
     @staticmethod
     def _encode_job_value(column: str, value: Any) -> Any:
-        if column in {"reference_json", "multipart_parts_json", "result_json", "metadata_json"} and not isinstance(value, str):
+        if column.endswith("_json") and not isinstance(value, str):
             return json.dumps(value, separators=(",", ":"))
         if column in {"cancel_requested"}:
             return int(bool(value))
@@ -346,5 +364,7 @@ class StateStore:
         row["multipart_parts"] = json.loads(row.pop("multipart_parts_json") or "[]")
         row["result"] = json.loads(row.pop("result_json") or "null")
         row["metadata"] = json.loads(row.pop("metadata_json") or "{}")
+        for name in ("processing", "checkpoint", "processing_result"):
+            row[name] = json.loads(row.pop(f"{name}_json", "{}") or "{}")
         row["cancel_requested"] = bool(row.get("cancel_requested"))
         return row

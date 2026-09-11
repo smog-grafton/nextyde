@@ -1,5 +1,7 @@
 # Strategy 3: Coolify And Docker Deployment
 
+For Telescope media processing, use the [current processing deployment runbook](../telegram-processing.md#production-deployment). It requires one web process with persistent local source/output storage and includes all stage workers. The handoff examples below describe the separate legacy NBX route.
+
 `telebot` already includes its own Dockerfile. In Coolify you can deploy it as a web UI service, a watcher service, or both. The default container command runs the web UI on port `8765`.
 
 ## Existing production resource: add this delta
@@ -27,7 +29,7 @@ Notes:
 
 - `MAX_CONCURRENT_UPLOADS` is a legacy variable from older deployments and the current telebot code does not read it. You can leave it in Coolify, but it has no effect.
 - If you want `path_copy` instead of `source_url`, both containers must mount the same shared intake volume. Being on the same server is not enough by itself.
-- Keep `VIDEO_PREP_ENABLED=true` if you still want download-only jobs to optimize locally, but normal worker handoffs will skip local prep when `WORKER_HANDLES_VIDEO_PREP=true`.
+- Download-only jobs preserve the original. Normal NBX handoffs skip local prep when `WORKER_HANDLES_VIDEO_PREP=true`. Telescope profiles operate independently of those legacy settings.
 
 Example shared-volume layout for `path_copy`:
 
@@ -119,7 +121,7 @@ Create a second service from the same repo and override the container command to
 python main.py
 ```
 
-Use the same environment variables and the same `/data` volume.
+Use a separate Telethon session (`TG_SESSION_NAME`) and separate `DB_PATH`. Do not share the web service's live Telegram session/state. This watcher runs the legacy NBX route and is not needed for Telescope imports.
 
 ### 3. Temp-file-only service
 
@@ -138,7 +140,7 @@ This service does not log in to Telegram. It only serves temp files already prod
 
 ## Important notes
 
-- The image already installs `ffmpeg`, so you usually leave `FFMPEG_BINARY` and `FFPROBE_BINARY` blank.
+- The image installs `ffmpeg`, `ffprobe`, and `HandBrakeCLI`; binary override variables can normally stay blank.
 - The health endpoint is `/health`.
 - The default Docker command is the web UI. Only override the command for the watcher service.
 - If you use `TG_SESSION_NAME=/data/narabox_telebot`, Telethon will create `/data/narabox_telebot.session`.

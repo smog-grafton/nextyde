@@ -333,6 +333,7 @@ class TelescopeRequest(BaseModel):
     storage_target: str = "auto"
     portal_source_id: str | int | None = None
     metadata: dict | None = None
+    processing: dict | None = None
 
 
 @app.post("/api/process")
@@ -420,12 +421,18 @@ def _public_telescope_job(job: dict) -> dict:
     public = {
         key: value
         for key, value in job.items()
-        if key not in {"multipart_upload_id", "multipart_parts", "metadata"}
+        if key not in {"multipart_upload_id", "multipart_parts", "metadata", "checkpoint"}
     }
     metadata = job.get("metadata") or {}
     public["streamed_bytes"] = int(metadata.get("streamed_bytes") or job.get("bytes_transferred") or 0)
     public["transfer_speed_bytes_per_second"] = int(metadata.get("transfer_speed_bytes_per_second") or 0)
     public["eta_seconds"] = metadata.get("eta_seconds")
+    public["stage"] = metadata.get("stage", job.get("status"))
+    public["stage_progress"] = metadata.get("stage_progress", 0)
+    public["elapsed_seconds"] = metadata.get("elapsed_seconds")
+    public["attempt"] = int(job.get("attempts") or 0)
+    for name in ("download_progress", "processing_progress", "upload_progress"):
+        public[name] = metadata.get(name, 0)
     return public
 
 
@@ -438,6 +445,7 @@ async def _submit_telescope(req: TelescopeRequest) -> dict:
             storage_target=req.storage_target,
             portal_source_id=req.portal_source_id,
             metadata=req.metadata,
+            processing=req.processing,
         )
     except (ValueError, RuntimeError) as exc:
         raise HTTPException(422, detail=str(exc)) from exc
@@ -613,6 +621,9 @@ async def api_health():
         "active_jobs": _active_job_count(),
         "ffmpeg_available": tools.ffmpeg.available,
         "ffprobe_available": tools.ffprobe.available,
+        "handbrake_available": bool(tools.handbrake and tools.handbrake.available),
+        "handbrake_version": tools.handbrake.version if tools.handbrake else None,
+        "telescope_running": telescope_scheduler is not None and telescope_scheduler._dispatch_task is not None,
         "ffmpeg_path": tools.ffmpeg.path,
         "ffprobe_path": tools.ffprobe.path,
         "ffmpeg_version": tools.ffmpeg.version,
@@ -702,6 +713,18 @@ async def api_worker_telescope_retry(
 
 @app.get("/health")
 async def root_health():
+    if app_settings is None:
+        raise HTTPException(503, detail="Worker configuration/startup is incomplete.")
+    files_only = os.getenv("WEB_DISABLE_TELEGRAM", "").strip().lower() in {"1", "true", "yes", "on"}
+    if not files_only and (worker is None or not authorized):
+        raise HTTPException(503, detail="Telegram worker is not connected.")
+    if not files_only and app_settings.telescope_enabled:
+        if (telescope_scheduler is None or telescope_scheduler._dispatch_task is None
+                or telescope_scheduler._dispatch_task.done()):
+            raise HTTPException(503, detail="Telescope scheduler is not running.")
+        media = await asyncio.to_thread(detect_media_tools)
+        if not media.ready or not media.handbrake or not media.handbrake.available:
+            raise HTTPException(503, detail="Required media tools are unavailable.")
     return {"status": "ok"}
 
 
@@ -1053,7 +1076,7 @@ def _html() -> str:
           </label>
           <label class="checkbox-row">
             <input type="checkbox" id="telescopeDirect" name="telescope_direct">
-            <span><strong>Telescope direct storage.</strong> Stream the original Telegram file straight into object storage without NBX or a full local copy.</span>
+            <span><strong>Telescope — Auto processing.</strong> Inspect the movie and prepare the fastest compatible playback source, preserving streams whenever possible. Use Portal for compression profiles.</span>
           </label>
           <label for="storageTarget"><strong>Telescope storage destination</strong></label>
           <select id="storageTarget" name="storage_target">
@@ -1093,7 +1116,7 @@ def _html() -> str:
 
   <script>
     const TERMINAL_STATUSES = new Set(['done', 'ready', 'failed', 'cancelled', 'destroyed', 'expired']);
-    const CANCELLABLE_STATUSES = new Set(['queued', 'retrying', 'resolving', 'finding_message', 'waiting_for_slot', 'transferring', 'downloading', 'waiting_to_prepare', 'preparing', 'uploading']);
+    const CANCELLABLE_STATUSES = new Set(['queued', 'retrying', 'resolving', 'finding_message', 'waiting_for_slot', 'transferring', 'downloading', 'waiting_to_prepare', 'preparing', 'uploading', 'inspecting', 'waiting_for_space', 'waiting_for_process', 'waiting_for_media', 'waiting_for_upload', 'preparing_mp4', 'converting_audio', 'optimizing_video', 'validating', 'verifying']);
     const form = document.getElementById('form');
     const linksInput = document.getElementById('linksInput');
     const submitBtn = document.getElementById('submitBtn');

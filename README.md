@@ -42,37 +42,33 @@ Telebot normalizes every URL into a Telegram peer, message ID, and optional topi
 
 Private `/c/` links use the account's existing membership. Telebot converts the internal channel ID to the marked peer ID (for example, `2489865945` becomes `-1002489865945`) and refreshes the account's dialogs if Telethon's local entity cache is cold. It never auto-joins an invite link during an import.
 
-## Telescope direct object-storage imports
+## Telescope media processing and object storage
 
-Telescope is the fast, original-only path alongside the existing Tele-OB/NBX workflow:
+Telescope is the persisted Telegram acquisition and media-normalization path alongside Tele-OB/NBX:
 
 ```text
-Portal -> Teletyde -> Telegram chunk iterator -> S3 multipart upload -> verify object -> signed Portal callback
+Portal -> persistent Teletyde queue -> download -> ffprobe -> cheapest compatible operation
+       -> validate final media -> multipart Contabo/R2 upload -> HEAD verification -> signed Portal callback
 ```
 
-It does not download the complete movie to local disk and does not involve NBX. Each active transfer uses bounded multipart working memory (8 MB parts by default, plus a temporary part copy and SDK/chunk overhead), independent of the movie's total size. The original container is preserved; Telescope does not claim to transcode MKV, generate HLS, compress, or create Fast Start MP4 output.
+The default **Auto** profile copies everything that is safe to copy. Compatible MKV becomes Fast Start MP4 with stream copy; incompatible audio alone becomes AAC; video encoding is reserved for incompatible video or an explicit compression profile. Compatible optimized MP4 passes through unchanged. **Keep Original** validates and preserves the source, including its original playback limitations.
 
-The SQLite queue uses WAL mode and persists jobs, Telegram references, target/object identity, byte progress, multipart upload IDs and completed ETags. Interrupted transfers are returned to the queue on restart and continue from their last completed S3 part. Global direct-transfer concurrency defaults to four, with a separate per-channel limit of two. These limits do not change the legacy download or FFmpeg pools.
+Administrators select Auto, Fast MP4 Conversion, 720p Balanced/Compact/Extra Compact, 1080p Balanced, Keep Original, or Custom in the existing movie/episode source form. Settings are a validated JSON object, never a shell command. RF is constant quality, not a promised output size. Actual sizes, savings, operation, selected audio track, elapsed time, and stage progress are recorded.
 
-In production, place `DB_PATH` on a persistent volume; otherwise a container replacement cannot recover the queue or multipart IDs.
+Telescope now requires persistent local disk for the source and output. Mount both `DB_PATH` and `TEMP_DIR` persistently. Download, inspection, remux/audio work, full encoding, and upload have separate limits. The default is one software video encode, two downloads, and two uploads; cheap remuxes can proceed during a long encode. Checkpoints reuse downloads, validated outputs, multipart parts, and completed remote objects on retry. Failed-job files are retained for 72 hours by default.
 
-Enable it with `TELESCOPE_ENABLED=true`, configure one or more target blocks from `.env.example`, and set matching callback secrets:
+Enable `TELESCOPE_ENABLED=true`, configure destination blocks in `.env.example`, and set `TELESCOPE_CALLBACK_URL` plus a shared `TELESCOPE_CALLBACK_SECRET` on Teletyde and Portal. Portal sends only logical targets (`auto`, `contabo_nbx`, `contabo_nb_nbx`, `r2_nbx`); storage credentials stay on Teletyde.
 
-- Teletyde: `TELESCOPE_CALLBACK_URL` and `TELESCOPE_CALLBACK_SECRET`
-- Portal: `TELESCOPE_CALLBACK_SECRET`
+Authenticated worker API:
 
-Portal submits only a logical target (`auto`, `contabo_nbx`, `contabo_nb_nbx`, or `r2_nbx`). All S3 credentials remain on Teletyde. Automatic selection follows the NBX convention: enabled/writable targets must have safe capacity, then the highest priority wins.
-
-Worker API:
-
-- `POST /api/worker/telescope/jobs` — persist and accept immediately with HTTP 202
-- `GET /api/worker/telescope/jobs/{job_id}` — status/polling fallback
+- `POST /api/worker/telescope/jobs` — structured `processing` object, durable HTTP 202 acceptance
+- `GET /api/worker/telescope/jobs/{job_id}` — progress, inspection and processing results
 - `POST /api/worker/telescope/jobs/{job_id}/cancel`
 - `POST /api/worker/telescope/jobs/{job_id}/retry`
 
-The web dashboard exposes the same direct-storage choice and shows both legacy and Telescope jobs together.
+Run **one** `python -m app.web` process for Telescope, with one ASGI worker and one Telethon session. Do not start another process against the same database/session. The web service runs the scheduler and stage pools itself; it does not need separate download/encoding/upload processes.
 
-Transfer progress is sampled while Telegram chunks arrive, while `bytes_transferred` remains the crash-safe number already committed as S3 parts. If Telegram produces no bytes for `TELESCOPE_TELEGRAM_STALL_TIMEOUT_SECONDS`, Telescope closes that stream and retries the persistent job up to `TELESCOPE_JOB_MAX_ATTEMPTS`; it no longer remains indefinitely at `transferring / 0%`.
+See the [engineering audit and deployment runbook](docs/telegram-processing.md), [contract examples](contracts/processing-v1.json), and [real benchmark data](docs/testing/media-benchmark.json).
 
 ## Deployment guides
 
@@ -170,19 +166,9 @@ FFPROBE_BINARY=
 
 ### Video preparation behavior
 
-When `WORKER_HANDLES_VIDEO_PREP=true`, telebot skips local transcoding/compression for normal worker handoffs and sends the original download to Laravel instead. The local video prep settings below only apply when you disable that delegation for normal upload/handoff jobs.
+`WORKER_HANDLES_VIDEO_PREP=true` preserves the existing NBX handoff boundary: NBX owns normalization for Tele-OB/watcher handoffs. Raw download-only URLs still preserve originals intentionally. Telescope always uses its own processing profile and registers its validated final object directly with Portal; it does not send that file through NBX again.
 
-If local video prep is active, telebot:
-
-- Detects `ffmpeg`/`ffprobe` at runtime (env override first, then `PATH`, with `-version` validation)
-- Probes source media and decides whether to keep source or transcode
-- Transcodes to MP4 with `libx264` + `aac` + `+faststart` when needed
-- Enforces a hard size cap for oversized videos so exposed/uploaded files stay at or below `VIDEO_PREP_TARGET_MAX_MB`
-- Starts capped jobs from the lower `VIDEO_PREP_CAP_HEIGHT_LADDER` so weaker VPS instances do not waste hours trying a too-heavy first pass
-- Keeps only primary video and first audio stream (`-map 0:v:0 -map 0:a:0?`)
-- Downscales oversized sources to a max height (default `720`) without upscaling
-
-If video prep is enabled but media tools are missing or transcoding fails, the job fails with a clear error so issues are visible in production logs/UI.
+Legacy local preparation (when delegation is disabled) now uses the same stream-aware Auto engine. The former extension-triggered transcode and hard size cap have been removed. `VIDEO_PREP_MAX_HEIGHT`, `VIDEO_PREP_CRF`, `VIDEO_PREP_PRESET`, `VIDEO_PREP_MIN_SIZE_MB_FOR_TRANSCODE`, `VIDEO_PREP_TARGET_MAX_MB`, and `VIDEO_PREP_CAP_HEIGHT_LADDER` remain parseable for old environment files but no longer drive a size-cap encode. Select an explicit Telescope compression profile for smaller files. `VIDEO_PREP_TIMEOUT_SECONDS` remains the process timeout.
 
 ## Deploy on VPS (Coolify)
 

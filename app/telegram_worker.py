@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shutil
+import threading
 import time
 from pathlib import Path
 from typing import Any, AsyncIterator, Callable, Awaitable
+from uuid import uuid4
 
 ProgressCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
 
@@ -25,6 +28,7 @@ from app.link_parser import (
     find_telegram_message_reference,
     parse_telegram_reference,
 )
+from app.media_processing import prepare_media_for_processing, MediaProcessingCancelled
 from app.media_tools import detect_media_tools
 from app.temp_url import build_signed_temp_url
 from app.video_prepare import (
@@ -169,6 +173,10 @@ class TelegramPipeWorker:
 
         for child in list(self.settings.temp_dir.iterdir()):
             try:
+                # Telescope owns persistent checkpoints and retention in this
+                # directory; an old source may belong to an active long encode.
+                if child.name == "telescope":
+                    continue
                 if child.is_dir():
                     files = sorted((path for path in child.rglob("*") if path.is_file()), key=lambda path: path.stat().st_mtime)
                     if not files:
@@ -228,15 +236,28 @@ class TelegramPipeWorker:
         progress_callback: Callable[[int, int], None] | None = None,
     ) -> None:
         file_size = int(getattr(message.file, "size", 0) or 0)
+        reserve = int(getattr(self.settings, "telescope_disk_reserve_mb", 2048)) * 1024 * 1024
+        if shutil.disk_usage(destination.parent).free < max(0, file_size) * 3 + reserve:
+            raise RuntimeError("Insufficient temporary disk space for Telegram download and media preparation.")
+        partial = destination.with_name(destination.name + ".part")
+        self._track_temp_path(partial)
         dc_id, input_location = telethon_utils.get_input_location(message.media or message)
-        await self.client.download_file(
-            input_location,
-            file=destination,
-            part_size_kb=self._resolve_download_part_size_kb(),
-            file_size=file_size or None,
-            progress_callback=progress_callback,
-            dc_id=dc_id,
-        )
+        try:
+            await self.client.download_file(
+                input_location,
+                file=partial,
+                part_size_kb=self._resolve_download_part_size_kb(),
+                file_size=file_size or None,
+                progress_callback=progress_callback,
+                dc_id=dc_id,
+            )
+            actual_size = partial.stat().st_size if partial.is_file() else 0
+            if actual_size <= 0 or (file_size > 0 and actual_size != file_size):
+                raise RuntimeError(f"Telegram download size mismatch: expected {file_size}, received {actual_size} bytes.")
+            partial.replace(destination)
+        finally:
+            partial.unlink(missing_ok=True)
+            self._release_temp_path(partial)
 
     async def _acquire_stage_slot(self, semaphore: asyncio.Semaphore, progress_extra: dict[str, Any] | None = None) -> None:
         while True:
@@ -569,8 +590,11 @@ class TelegramPipeWorker:
             job_dir.mkdir(parents=True, exist_ok=True)
             temp_file = job_dir / file_name
         else:
-            temp_file = self.settings.temp_dir / file_name
-        optimized_temp_file = temp_file.with_name(f"{temp_file.stem}.delivery.mp4")
+            # Duplicate Telegram filenames must never overwrite another job.
+            job_dir = self.settings.temp_dir / str(uuid4())
+            job_dir.mkdir(parents=True, exist_ok=True)
+            temp_file = job_dir / file_name
+        optimized_temp_file = temp_file.with_name("output.mp4")
         metadata = extract_metadata(original_file_name)
         metadata.update(
             {
@@ -658,172 +682,55 @@ class TelegramPipeWorker:
             if is_cancelled():
                 raise JobCancelledError("Job cancelled")
 
-            prep_result = None
-            prep_analysis = None
             if prepare_video_locally:
-                await self._invoke_progress(
-                    progress_callback,
-                    "preparing",
-                    {"file_name": file_name, "progress_pct": 20, "message": "Analyzing media…"},
-                )
                 loop = asyncio.get_running_loop()
+                stop = threading.Event()
 
                 def prep_progress(stage: str, data: dict[str, Any]) -> None:
-                    pct = int(data.get("progress_pct", 20))
-                    attempt_index = data.get("attempt_index")
-                    attempt_count = data.get("attempt_count")
-
-                    def _update_progress() -> None:
-                        if progress_extra is not None:
-                            progress_extra["progress_pct"] = pct
-                            progress_extra["file_name"] = file_name
-
-                    loop.call_soon_threadsafe(_update_progress)
-                    msg = "Preparing video…"
-                    if stage == "probing_started":
-                        msg = "Analyzing media…"
-                    elif stage == "transcoding_started":
-                        msg = "Transcoding for web delivery…"
-                    elif stage == "transcoding_progress":
-                        msg = f"Transcoding for web delivery… ({pct}%)"
-                    elif stage == "probe_output":
-                        msg = "Validating compressed output…"
-                    elif stage == "prep_skipped":
-                        msg = "Source already delivery-ready. Skipping transcode."
-                    elif stage == "prep_done":
-                        msg = "Video preparation complete."
-                    if attempt_count and attempt_count > 1 and stage in {"transcoding_started", "transcoding_progress"}:
-                        msg += f" attempt {attempt_index}/{attempt_count}"
-                    if progress_callback:
-                        loop.call_soon_threadsafe(
-                            lambda: loop.create_task(
-                                self._invoke_progress(
-                                    progress_callback,
-                                    "preparing",
-                                    {"file_name": file_name, "progress_pct": pct, "message": msg},
-                                )
-                            )
-                        )
-
-                prep_analysis = await asyncio.to_thread(
-                    analyze_video_for_delivery,
-                    self.settings,
-                    temp_file,
-                    prep_progress,
-                )
-                metadata.update(
-                    {
-                        "video_prep_applied": False,
-                        "video_prep_reason": prep_analysis.decision.reason,
-                        "video_prep_mode": prep_analysis.decision.mode,
-                        "video_prep_target_max_bytes": prep_analysis.decision.target_max_bytes,
+                    messages = {
+                        "inspecting": "Inspecting source streams…",
+                        "preparing_mp4": "Preparing MP4 with stream copy…",
+                        "converting_audio": "Converting audio; preserving video…",
+                        "optimizing_video": "Optimizing video…",
+                        "validating": "Validating final media…",
                     }
-                )
+                    payload = dict(data, file_name=file_name, message=messages.get(stage, stage))
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._invoke_progress(progress_callback, "preparing", payload), loop)
+                    future.result()
 
-                if is_cancelled():
-                    raise JobCancelledError("Job cancelled")
-
-                if prep_analysis.decision.should_transcode:
-                    await self._invoke_progress(
-                        progress_callback,
-                        "waiting_to_prepare",
-                        {
-                            "file_name": file_name,
-                            "progress_pct": max(21, progress_extra.get("progress_pct", 20) if progress_extra else 20),
-                            "message": "Waiting for video slot…",
-                        },
-                    )
-                    await self._acquire_stage_slot(self._transcode_sem, progress_extra)
+                await self._acquire_stage_slot(self._transcode_sem, progress_extra)
+                try:
+                    preparation = asyncio.create_task(asyncio.to_thread(
+                        prepare_media_for_processing, self.settings, temp_file,
+                        metadata.get("processing"), progress_callback=prep_progress,
+                        should_cancel=lambda: stop.is_set() or is_cancelled(),
+                    ))
                     try:
-                        prep_result = await asyncio.to_thread(
-                            prepare_video_for_delivery,
-                            self.settings,
-                            temp_file,
-                            prep_progress,
-                            is_cancelled,
-                            prep_analysis,
-                        )
-                    except VideoPrepCancelledError as exc:
+                        prepared = await asyncio.shield(preparation)
+                    except asyncio.CancelledError:
+                        stop.set()
+                        await asyncio.gather(preparation, return_exceptions=True)
+                        raise
+                    except MediaProcessingCancelled as exc:
                         raise JobCancelledError(str(exc)) from exc
-                    finally:
-                        self._transcode_sem.release()
-
-                    delivery_file = prep_result.delivery_path
-                    await self._invoke_progress(
-                        progress_callback,
-                        "preparing",
-                        {
-                            "file_name": delivery_file.name,
-                            "progress_pct": 97 if prep_result.changed else 100,
-                            "message": "Transcode complete, finalizing output…" if prep_result.changed else "Source already delivery-ready. Skipping transcode.",
-                        },
-                    )
-                    metadata.update(
-                        {
-                            "video_prep_applied": prep_result.changed,
-                            "video_prep_input_size": prep_result.source_size_bytes,
-                            "video_prep_output_size": prep_result.output_size_bytes,
-                            "video_prep_attempts_used": prep_result.attempts_used,
-                            "video_prep_profile": {
-                                "codec": "libx264",
-                                "audio_codec": "aac",
-                                "crf": self.settings.video_prep_crf if prep_result.decision.mode != "cap" else None,
-                                "preset": self.settings.video_prep_preset,
-                                "max_height": self.settings.video_prep_max_height,
-                                "faststart": True,
-                                "mode": prep_result.decision.mode,
-                                "size_cap_mb": self.settings.video_prep_target_max_mb if prep_result.decision.enforce_size_cap else None,
-                            },
-                            "video_codec_out": (
-                                prep_result.output_probe.video.codec
-                                if prep_result.output_probe and prep_result.output_probe.video
-                                else (prep_result.source_probe.video.codec if prep_result.source_probe.video else None)
-                            ),
-                            "audio_codec_out": (
-                                prep_result.output_probe.audio.codec
-                                if prep_result.output_probe and prep_result.output_probe.audio
-                                else (prep_result.source_probe.audio.codec if prep_result.source_probe.audio else None)
-                            ),
-                            "video_width_out": (
-                                prep_result.output_probe.video.width
-                                if prep_result.output_probe and prep_result.output_probe.video
-                                else (prep_result.source_probe.video.width if prep_result.source_probe.video else None)
-                            ),
-                            "video_height_out": (
-                                prep_result.output_probe.video.height
-                                if prep_result.output_probe and prep_result.output_probe.video
-                                else (prep_result.source_probe.video.height if prep_result.source_probe.video else None)
-                            ),
-                            "video_frame_rate_out": (
-                                prep_result.output_probe.video.frame_rate
-                                if prep_result.output_probe and prep_result.output_probe.video
-                                else (prep_result.source_probe.video.frame_rate if prep_result.source_probe.video else None)
-                            ),
-                        }
-                    )
-                    if prep_result.changed and not self.settings.video_prep_keep_original_on_success:
-                        try:
-                            if temp_file != delivery_file and temp_file.is_file():
-                                temp_file.unlink()
-                                LOGGER.info(
-                                    "Video prep cleanup: removed source file after optimization: %s",
-                                    temp_file,
-                                )
-                        except OSError as exc:
-                            LOGGER.warning("Could not remove source file after video prep: %s", exc)
-                else:
-                    metadata.update(
-                        {
-                            "video_prep_input_size": prep_analysis.source_probe.size_bytes,
-                            "video_prep_output_size": prep_analysis.source_probe.size_bytes,
-                            "video_prep_attempts_used": 0,
-                            "video_codec_out": prep_analysis.source_probe.video.codec if prep_analysis.source_probe.video else None,
-                            "audio_codec_out": prep_analysis.source_probe.audio.codec if prep_analysis.source_probe.audio else None,
-                            "video_width_out": prep_analysis.source_probe.video.width if prep_analysis.source_probe.video else None,
-                            "video_height_out": prep_analysis.source_probe.video.height if prep_analysis.source_probe.video else None,
-                            "video_frame_rate_out": prep_analysis.source_probe.video.frame_rate if prep_analysis.source_probe.video else None,
-                        }
-                    )
+                finally:
+                    self._transcode_sem.release()
+                delivery_file = prepared.delivery_path
+                diagnostics = prepared.metadata()
+                metadata.update({
+                    "processing_result": diagnostics,
+                    "video_prep_applied": prepared.method != "passthrough",
+                    "video_prep_mode": prepared.method,
+                    "video_prep_reason": prepared.decision.reason,
+                    "video_prep_input_size": prepared.source_size_bytes,
+                    "video_prep_output_size": prepared.output_size_bytes,
+                    "video_codec_out": prepared.output_probe.video.codec,
+                    "audio_codec_out": prepared.output_probe.audio.codec if prepared.output_probe.audio else None,
+                    "video_width_out": prepared.output_probe.video.width,
+                    "video_height_out": prepared.output_probe.video.height,
+                    "video_frame_rate_out": prepared.output_probe.video.frame_rate,
+                })
 
             if download_only:
                 keep_temp_files = True
