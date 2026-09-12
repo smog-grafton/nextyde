@@ -32,7 +32,7 @@ app_settings: Settings | None = None
 authorized = False
 telescope_scheduler: TelescopeScheduler | None = None
 
-TERMINAL_STATUSES = {"done", "failed", "cancelled", "destroyed", "expired"}
+TERMINAL_STATUSES = {"done", "ready", "failed", "cancelled", "destroyed", "expired"}
 CANCELLABLE_STATUSES = {"queued", "resolving", "finding_message", "downloading", "waiting_to_prepare", "preparing", "uploading"}
 
 
@@ -601,6 +601,42 @@ async def api_destroy(job_id: str):
     return {"ok": True, "message": "File deleted"}
 
 
+@app.post("/api/cleanup-temp-storage")
+async def api_cleanup_temp_storage():
+    """Immediately clear completed local files from both job pipelines."""
+    removed_downloads = 0
+    for job in list(jobs.values()):
+        if job.get("status") not in {"downloaded", "done", "failed", "cancelled", "expired"} or not job.get("temp_path"):
+            continue
+        path = Path(job["temp_path"])
+        try:
+            if path.is_file():
+                path.unlink()
+            root_temp_dir = worker.settings.temp_dir if worker is not None else path.parent
+            parent = path.parent
+            while parent != root_temp_dir and parent.exists():
+                try:
+                    parent.rmdir()
+                except OSError:
+                    break
+                parent = parent.parent
+            job["status"] = "destroyed"
+            job["message"] = "Temporary file deleted."
+            job["temp_path"] = None
+            _touch_job(job)
+            removed_downloads += 1
+        except OSError:
+            LOG.warning("Could not clear temporary file for job %s", job.get("job_id"), exc_info=True)
+
+    removed_telescope = await telescope_scheduler.cleanup_terminal_files(force=True) if telescope_scheduler else 0
+    return {
+        "ok": True,
+        "removed_downloads": removed_downloads,
+        "removed_telescope_jobs": removed_telescope,
+        "message": f"Cleared {removed_downloads + removed_telescope} completed temporary job(s).",
+    }
+
+
 @app.get("/api/jobs")
 async def api_jobs(limit: int = 30):
     _prune_recent_jobs(worker)
@@ -675,6 +711,12 @@ async def api_worker_destroy_job(job_id: str, authorization: str | None = Header
     return await api_destroy(job_id)
 
 
+@app.post("/api/worker/cleanup-temp-storage")
+async def api_worker_cleanup_temp_storage(authorization: str | None = Header(default=None)):
+    _require_worker_token(authorization)
+    return await api_cleanup_temp_storage()
+
+
 @app.post("/api/worker/telescope/jobs", status_code=202)
 async def api_worker_telescope_create_job(
     req: TelescopeRequest,
@@ -709,6 +751,21 @@ async def api_worker_telescope_retry(
 ):
     _require_worker_token(authorization)
     return await api_telescope_retry(job_id)
+
+
+@app.post("/api/telescope/jobs/{job_id}/destroy")
+async def api_telescope_destroy(job_id: str):
+    if not telescope_scheduler:
+        raise HTTPException(503, detail="Telescope is unavailable.")
+    if not await telescope_scheduler.destroy(job_id):
+        raise HTTPException(409, detail="Only terminal Telescope jobs can have their temporary storage cleared.")
+    return {"ok": True, "job_id": job_id, "status": "destroyed"}
+
+
+@app.post("/api/worker/telescope/jobs/{job_id}/destroy")
+async def api_worker_telescope_destroy(job_id: str, authorization: str | None = Header(default=None)):
+    _require_worker_token(authorization)
+    return await api_telescope_destroy(job_id)
 
 
 @app.get("/health")
@@ -1099,7 +1156,7 @@ def _html() -> str:
         <div class="panel">
           <div class="section-head">
             <h3>Active jobs</h3>
-            <span id="activeCount">0 active</span>
+            <span><span id="activeCount">0 active</span> <button class="btn-danger" type="button" id="clearTempStorage">Clear temporary storage</button></span>
           </div>
           <div class="job-grid" id="activeJobs"></div>
         </div>
@@ -1205,6 +1262,9 @@ def _html() -> str:
       }
       if (job.delivery_mode === 'telescope' && (job.status === 'failed' || job.status === 'cancelled')) {
         actions += '<button type="button" class="btn-secondary" data-action="retry-telescope" data-job-id="' + escapeHtml(job.job_id) + '">Retry Telescope</button>';
+      }
+      if (job.delivery_mode === 'telescope' && ['ready', 'failed', 'cancelled'].includes(job.status)) {
+        actions += '<button type="button" class="btn-danger" data-action="destroy-telescope" data-job-id="' + escapeHtml(job.job_id) + '">Clear temporary storage</button>';
       }
 
       let tempUrlPanel = '';
@@ -1326,6 +1386,18 @@ def _html() -> str:
         return;
       }
 
+      if (target.dataset.action === 'destroy-telescope' && target.dataset.jobId) {
+        if (!window.confirm('Clear this Telescope job\'s local temporary files? The completed remote object will remain available.')) return;
+        try {
+          await apiJson('/api/telescope/jobs/' + encodeURIComponent(target.dataset.jobId) + '/destroy', { method: 'POST' });
+          showNotice('Telescope temporary storage cleared.', 'ok');
+          await refreshJobs();
+        } catch (error) {
+          showNotice(error.message || 'Could not clear Telescope storage.', 'error');
+        }
+        return;
+      }
+
       if (target.dataset.action === 'destroy' && target.dataset.jobId) {
         try {
           await apiJson('/api/destroy/' + encodeURIComponent(target.dataset.jobId), { method: 'POST' });
@@ -1351,6 +1423,17 @@ def _html() -> str:
           showNotice(error.message || 'Force re-import failed.', 'error');
           target.disabled = false;
         }
+      }
+    });
+
+    document.getElementById('clearTempStorage').addEventListener('click', async () => {
+      if (!window.confirm('Clear all completed temporary files from Teletyde? Remote completed objects will remain available.')) return;
+      try {
+        const result = await apiJson('/api/cleanup-temp-storage', { method: 'POST' });
+        showNotice(result.message || 'Temporary storage cleared.', 'ok');
+        await refreshJobs();
+      } catch (error) {
+        showNotice(error.message || 'Could not clear temporary storage.', 'error');
       }
     });
 

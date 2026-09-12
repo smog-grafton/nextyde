@@ -41,6 +41,14 @@ LOGGER = logging.getLogger("telebot")
 MEDIA_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".mpeg", ".mpg", ".ts", ".m2ts"}
 
 
+def unsupported_media_message(message_id: int | str) -> str:
+    return (
+        f"Telegram message {message_id} does not contain a downloadable video file. "
+        "Images/photos are not supported; use a message with a video document "
+        "attachment such as MP4, MKV, MOV, or WEBM."
+    )
+
+
 class JobCancelledError(Exception):
     """Raised when a job is cancelled via the web UI or API."""
 
@@ -390,7 +398,7 @@ class TelegramPipeWorker:
         entity, message = await self.resolve_message_reference(reference)
         if not self._is_supported_media(message):
             raise TelegramSourceError(
-                f"Telegram message {reference.message_id} exists but contains no supported downloadable video/document."
+                unsupported_media_message(reference.message_id)
             )
         file_name = self._extract_file_name(message)
         return {
@@ -502,7 +510,7 @@ class TelegramPipeWorker:
         message = await self._fetch_reference_message(reference, entity)
         if not self._is_supported_media(message):
             raise TelegramSourceError(
-                f"Telegram message {reference.message_id} exists but contains no supported downloadable video/document."
+                unsupported_media_message(reference.message_id)
             )
         result_holder: dict[str, Any] = {}
 

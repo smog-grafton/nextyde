@@ -207,7 +207,7 @@ class StateStore:
     async def terminal_telescope_jobs(self) -> list[dict[str, Any]]:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
-            cursor = await db.execute("SELECT * FROM telescope_jobs WHERE status IN ('ready', 'failed', 'cancelled')")
+            cursor = await db.execute("SELECT * FROM telescope_jobs WHERE status IN ('ready', 'failed', 'cancelled', 'destroyed')")
             rows = await cursor.fetchall()
         return [self._decode_telescope_job(dict(row)) for row in rows]
 
@@ -258,7 +258,7 @@ class StateStore:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 "UPDATE telescope_jobs SET cancel_requested = 1, updated_at = ? "
-                "WHERE job_id = ? AND status NOT IN ('ready', 'failed', 'cancelled')",
+                "WHERE job_id = ? AND status NOT IN ('ready', 'failed', 'cancelled', 'destroyed')",
                 (time.time(), job_id),
             )
             await db.commit()
@@ -268,7 +268,7 @@ class StateStore:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 "UPDATE telescope_jobs SET status = 'queued', cancel_requested = 0, last_error = NULL, "
-                "completed_at = NULL, updated_at = ? WHERE job_id = ? AND status IN ('failed', 'cancelled')",
+                "completed_at = NULL, updated_at = ? WHERE job_id = ? AND status IN ('failed', 'cancelled', 'destroyed')",
                 (time.time(), job_id),
             )
             await db.commit()

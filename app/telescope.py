@@ -25,11 +25,11 @@ from app.link_parser import TelegramMessageReference, parse_telegram_reference
 from app.object_storage import ObjectStorageManager, S3MultipartUploader
 from app.processing_profiles import normalize_processing_options
 from app.media_processing import analyze_media_for_processing, prepare_media_for_processing, MediaVideoRepairRequired
-from app.telegram_worker import TelegramPipeWorker
+from app.telegram_worker import TelegramPipeWorker, unsupported_media_message
 
 
 LOGGER = logging.getLogger("telebot.telescope")
-TERMINAL_STATUSES = {"ready", "failed", "cancelled"}
+TERMINAL_STATUSES = {"ready", "failed", "cancelled", "destroyed"}
 MEDIA_STAGES = {"inspecting", "preparing_mp4", "converting_audio", "optimizing_video", "validating"}
 
 
@@ -143,6 +143,45 @@ class TelescopeScheduler:
         updated = await self.store.requeue_telescope_job(job_id)
         self._wake.set()
         return updated
+
+    async def destroy(self, job_id: str) -> bool:
+        """Delete a terminal job's local files while preserving remote output."""
+        job = await self.store.get_telescope_job(job_id)
+        if job is None or job.get("status") not in {"ready", "failed", "cancelled"}:
+            return False
+        if job_id in self._active_tasks and not self._active_tasks[job_id].done():
+            return False
+
+        directory = self._job_dir(job_id)
+        if job.get("status") != "ready":
+            await self._abort_upload(job)
+        if directory.is_dir() and not directory.is_symlink():
+            with (directory / ".job.lock").open("a+b") as lock:
+                try:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return False
+                await asyncio.to_thread(shutil.rmtree, directory)
+
+        await self.store.update_telescope_job(job_id, status="destroyed", completed_at=time.time())
+        self._wake.set()
+        return True
+
+    async def cleanup_terminal_files(self, *, force: bool = False) -> int:
+        """Remove terminal Telescope working directories and return a count."""
+        removed = 0
+        retention = getattr(self.settings, "telescope_failed_retention_hours", 72) * 3600
+        now = time.time()
+        for job in await self.store.terminal_telescope_jobs():
+            if job["job_id"] in self._active_tasks or job["status"] not in TERMINAL_STATUSES - {"destroyed"}:
+                continue
+            success = job["status"] == "ready" and job.get("callback_status") in {"delivered", "not_configured"}
+            expired = now - float(job.get("completed_at") or job["updated_at"]) > retention
+            if not force and not success and not expired:
+                continue
+            if await self.destroy(job["job_id"]):
+                removed += 1
+        return removed
 
     async def _dispatch_loop(self) -> None:
         while True:
@@ -305,7 +344,7 @@ class TelescopeScheduler:
             await self._report(job_id, "resolving", 0, force=True)
             _, message = await self.worker.resolve_message_reference(reference)
             if not self.worker._is_supported_media(message):
-                raise RuntimeError("Telegram message has no supported downloadable media.")
+                raise RuntimeError(unsupported_media_message(reference.message_id))
             total = int(getattr(message.file, "size", 0) or 0)
             if total <= 0:
                 raise RuntimeError("Telegram did not provide a valid media size.")
@@ -522,25 +561,7 @@ class TelescopeScheduler:
         await self._emit_event(await self.store.get_telescope_job(job_id), "ready")
 
     async def _cleanup_terminal_files(self):
-        retention = getattr(self.settings, "telescope_failed_retention_hours", 72) * 3600
-        for job in await self.store.terminal_telescope_jobs():
-            if job["job_id"] in self._active_tasks or job["status"] not in TERMINAL_STATUSES:
-                continue
-            success = job["status"] == "ready" and job.get("callback_status") in {"delivered", "not_configured"}
-            expired = time.time() - float(job.get("completed_at") or job["updated_at"]) > retention
-            if not success and not expired:
-                continue
-            directory = self._job_dir(job["job_id"])
-            if not directory.is_dir() or directory.is_symlink():
-                continue
-            with (directory / ".job.lock").open("a+b") as lock:
-                try:
-                    fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    continue
-                if job["status"] != "ready":
-                    await self._abort_upload(job)
-                await asyncio.to_thread(shutil.rmtree, directory)
+        await self.cleanup_terminal_files()
 
     async def _emit_event(self, job: dict[str, Any], event_type: str, discriminator: str = "") -> None:
         if (
