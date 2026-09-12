@@ -31,6 +31,7 @@ worker: TelegramPipeWorker | None = None
 app_settings: Settings | None = None
 authorized = False
 telescope_scheduler: TelescopeScheduler | None = None
+telescope_start_task: asyncio.Task[None] | None = None
 
 TERMINAL_STATUSES = {"done", "ready", "failed", "cancelled", "destroyed", "expired"}
 CANCELLABLE_STATUSES = {"queued", "resolving", "finding_message", "downloading", "waiting_to_prepare", "preparing", "uploading"}
@@ -89,6 +90,43 @@ def _job_with_temp_url(job: dict, current_worker: TelegramPipeWorker | None) -> 
     out = dict(job)
     out["temp_url"] = _build_temp_url(current_worker, out)
     return out
+
+
+def _safe_temp_file(path: str | Path, current_worker: TelegramPipeWorker | None) -> Path | None:
+    """Return a removable file only when it is safely inside TEMP_DIR."""
+    settings = current_worker.settings if current_worker is not None else app_settings
+    if settings is None:
+        return None
+
+    temp_root = settings.temp_dir.resolve()
+    candidate = Path(path).expanduser().resolve(strict=False)
+    try:
+        candidate.relative_to(temp_root)
+    except ValueError:
+        return None
+
+    # Telescope checkpoints have their own durable lifecycle and must never be
+    # handled by legacy download-only deletion.
+    telescope_root = temp_root / "telescope"
+    if candidate == telescope_root or telescope_root in candidate.parents:
+        return None
+
+    session_name = Path(settings.tg_session_name).expanduser()
+    session_path = session_name if session_name.name.endswith(".session") else Path(f"{session_name}.session")
+    protected_paths = {
+        session_path.resolve(strict=False),
+        Path(f"{session_path}-journal").resolve(strict=False),
+        settings.db_path.resolve(),
+        Path(f"{settings.db_path}-wal").resolve(strict=False),
+        Path(f"{settings.db_path}-shm").resolve(strict=False),
+    }
+    encrypted_session = os.getenv("TELEGRAM_SESSION_ENCRYPTED_FILE", "/app/deploy/narabox_telebot.session.enc")
+    protected_paths.add(Path(encrypted_session).expanduser().resolve(strict=False))
+    if candidate in protected_paths:
+        return None
+    if candidate == temp_root or not candidate.is_file():
+        return None
+    return candidate
 
 
 def _pick_recovered_file(files: list[Path]) -> Path:
@@ -261,9 +299,42 @@ def _require_worker_token(authorization: str | None) -> None:
         raise HTTPException(401, detail="Invalid worker API token.")
 
 
+async def _start_telescope_when_available(current_worker: TelegramPipeWorker) -> None:
+    """Acquire the singleton scheduler after a rolling deployment handoff."""
+    global telescope_scheduler
+
+    while True:
+        scheduler = TelescopeScheduler(current_worker, current_worker.store)
+        try:
+            await scheduler.start()
+        except RuntimeError as exc:
+            await scheduler.stop()
+            if "Another Telescope scheduler owns this state database" not in str(exc):
+                LOG.exception("Telescope scheduler could not start")
+                return
+            LOG.warning("Telescope scheduler is still owned by the previous container; retrying shortly.")
+            await asyncio.sleep(5)
+            continue
+        except asyncio.CancelledError:
+            await scheduler.stop()
+            raise
+        except Exception:
+            await scheduler.stop()
+            LOG.exception("Telescope scheduler could not start")
+            return
+
+        telescope_scheduler = scheduler
+        LOG.info(
+            "Telescope queue ready: %s global transfers, %s per Telegram channel",
+            current_worker.settings.telescope_max_active_jobs,
+            current_worker.settings.telescope_max_downloads_per_channel,
+        )
+        return
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global worker, authorized, app_settings, telescope_scheduler
+    global worker, authorized, app_settings, telescope_scheduler, telescope_start_task
     try:
         settings = Settings.load()
         app_settings = settings
@@ -289,17 +360,18 @@ async def lifespan(app: FastAPI):
                 LOG.info("Recovered %s download-only job(s) from temp storage", recovered)
             await worker.start_housekeeping(jobs)
             if authorized and settings.telescope_enabled:
-                telescope_scheduler = TelescopeScheduler(worker, worker.store)
-                await telescope_scheduler.start()
-                LOG.info(
-                    "Telescope queue ready: %s global transfers, %s per Telegram channel",
-                    settings.telescope_max_active_jobs,
-                    settings.telescope_max_downloads_per_channel,
+                telescope_start_task = asyncio.create_task(
+                    _start_telescope_when_available(worker),
+                    name="telescope-start",
                 )
     except Exception as exc:
         LOG.exception("Startup failed: %s", exc)
         authorized = False
     yield
+    if telescope_start_task:
+        telescope_start_task.cancel()
+        await asyncio.gather(telescope_start_task, return_exceptions=True)
+        telescope_start_task = None
     if telescope_scheduler:
         await telescope_scheduler.stop()
         telescope_scheduler = None
@@ -578,14 +650,15 @@ async def api_destroy(job_id: str):
     if not job.get("temp_path"):
         raise HTTPException(400, detail="No temp file recorded for this job")
 
-    path = Path(job["temp_path"])
-    if path.is_file():
-        try:
-            path.unlink()
-        except OSError as exc:
-            raise HTTPException(500, detail=f"Could not delete file: {exc}") from exc
+    path = _safe_temp_file(job["temp_path"], worker)
+    if path is None:
+        raise HTTPException(400, detail="The recorded path is not a safe temporary video file.")
+    try:
+        path.unlink()
+    except OSError as exc:
+        raise HTTPException(500, detail=f"Could not delete file: {exc}") from exc
 
-    root_temp_dir = worker.settings.temp_dir if worker is not None else path.parent
+    root_temp_dir = (worker.settings.temp_dir if worker is not None else app_settings.temp_dir).resolve()
     parent = path.parent
     while parent != root_temp_dir and parent.exists():
         try:
@@ -608,11 +681,13 @@ async def api_cleanup_temp_storage():
     for job in list(jobs.values()):
         if job.get("status") not in {"downloaded", "done", "failed", "cancelled", "expired"} or not job.get("temp_path"):
             continue
-        path = Path(job["temp_path"])
+        path = _safe_temp_file(job["temp_path"], worker)
+        if path is None:
+            LOG.warning("Refusing to clear unsafe temporary path for job %s", job.get("job_id"))
+            continue
         try:
-            if path.is_file():
-                path.unlink()
-            root_temp_dir = worker.settings.temp_dir if worker is not None else path.parent
+            path.unlink()
+            root_temp_dir = (worker.settings.temp_dir if worker is not None else app_settings.temp_dir).resolve()
             parent = path.parent
             while parent != root_temp_dir and parent.exists():
                 try:
@@ -776,8 +851,14 @@ async def root_health():
     if not files_only and (worker is None or not authorized):
         raise HTTPException(503, detail="Telegram worker is not connected.")
     if not files_only and app_settings.telescope_enabled:
-        if (telescope_scheduler is None or telescope_scheduler._dispatch_task is None
-                or telescope_scheduler._dispatch_task.done()):
+        if telescope_scheduler is None:
+            if telescope_start_task is not None and not telescope_start_task.done():
+                # Coolify may briefly run the old and new containers together.
+                # The web process is ready while the singleton queue waits for
+                # the previous container to release its advisory lock.
+                return {"status": "ok", "telescope": "starting"}
+            raise HTTPException(503, detail="Telescope scheduler is not running.")
+        if telescope_scheduler._dispatch_task is None or telescope_scheduler._dispatch_task.done():
             raise HTTPException(503, detail="Telescope scheduler is not running.")
         media = await asyncio.to_thread(detect_media_tools)
         if not media.ready or not media.handbrake or not media.handbrake.available:
