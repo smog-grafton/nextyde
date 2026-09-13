@@ -508,6 +508,35 @@ def _public_telescope_job(job: dict) -> dict:
     return public
 
 
+def _telescope_ui_job(job: dict) -> dict:
+    """Normalize a durable Telescope job for the shared dashboard feed."""
+    metadata = job.get("metadata") or {}
+    result = job.get("result") or {}
+    status = str(job.get("status") or "queued")
+    if status == "transferring":
+        message = (
+            f"Receiving Telegram media: {int(job.get('progress') or 0)}% "
+            f"({int(metadata.get('streamed_bytes') or 0) / 1048576:.1f} MiB received; "
+            f"{int(job.get('bytes_transferred') or 0) / 1048576:.1f} MiB durable)"
+        )
+    elif status == "retrying":
+        message = "Telegram stream stalled; retrying automatically."
+    else:
+        message = str(job.get("last_error") or status.replace("_", " "))
+
+    public = _public_telescope_job(job)
+    public.update({
+        "delivery_mode": "telescope",
+        "link": job.get("telegram_url"),
+        "progress_pct": int(job.get("progress") or 0),
+        "object_url": result.get("public_url") if isinstance(result, dict) else None,
+        "message": message,
+        "updated_ts": float(job.get("updated_at") or 0),
+        "storage_target": job.get("storage_target"),
+    })
+    return public
+
+
 async def _submit_telescope(req: TelescopeRequest) -> dict:
     if not telescope_scheduler or not worker or not authorized:
         raise HTTPException(503, detail="Telescope is disabled or Telegram is not connected.")
@@ -704,23 +733,40 @@ async def api_cleanup_temp_storage():
             LOG.warning("Could not clear temporary file for job %s", job.get("job_id"), exc_info=True)
 
     removed_telescope = await telescope_scheduler.cleanup_terminal_files(force=True) if telescope_scheduler else 0
+    active_downloads = sum(
+        1 for job in jobs.values() if not _is_terminal_status(job.get("status"))
+    )
+    active_telescope = 0
+    if worker is not None:
+        telescope_jobs = await worker.store.list_telescope_jobs(limit=500)
+        active_telescope = sum(1 for job in telescope_jobs if job.get("status") not in TERMINAL_STATUSES)
+    active_jobs = active_downloads + active_telescope
+    removed = removed_downloads + removed_telescope
+    message = f"Cleared {removed} completed temporary job(s)."
+    if active_jobs:
+        message += f" {active_jobs} active job(s) remain; cancel them before clearing their files."
+    if removed == 0 and not active_jobs:
+        message = "No completed temporary files were found to clear."
     return {
         "ok": True,
         "removed_downloads": removed_downloads,
         "removed_telescope_jobs": removed_telescope,
-        "message": f"Cleared {removed_downloads + removed_telescope} completed temporary job(s).",
+        "active_jobs": active_jobs,
+        "message": message,
     }
 
 
 @app.get("/api/jobs")
 async def api_jobs(limit: int = 30):
     _prune_recent_jobs(worker)
-    order = sorted(
-        jobs.items(),
-        key=lambda item: (item[1].get("updated_ts", item[1].get("_ts", 0)), item[1].get("_ts", 0)),
-        reverse=True,
-    )
-    return [_job_with_temp_url(job, worker) for _, job in order[:limit]]
+    normalized = [_job_with_temp_url(job, worker) for job in jobs.values()]
+    if worker is not None:
+        normalized.extend(
+            _telescope_ui_job(job)
+            for job in await worker.store.list_telescope_jobs(limit=500)
+        )
+    normalized.sort(key=lambda job: float(job.get("updated_ts") or job.get("_ts") or 0), reverse=True)
+    return normalized[:max(1, min(500, limit))]
 
 
 @app.get("/api/health")
@@ -729,7 +775,12 @@ async def api_health():
     return {
         "telegram": "connected" if authorized else ("disabled" if worker is None and app_settings is not None else "not_logged_in"),
         "worker": worker is not None,
-        "active_jobs": _active_job_count(),
+        "active_jobs": _active_job_count() + (
+            sum(
+                1 for job in await worker.store.list_telescope_jobs(limit=500)
+                if job.get("status") not in TERMINAL_STATUSES
+            ) if worker is not None else 0
+        ),
         "ffmpeg_available": tools.ffmpeg.available,
         "ffprobe_available": tools.ffprobe.available,
         "handbrake_available": bool(tools.handbrake and tools.handbrake.available),
@@ -1401,23 +1452,7 @@ def _html() -> str:
 
     async function refreshJobs() {
       try {
-        const responses = await Promise.all([
-          apiJson('/api/jobs?limit=50'),
-          apiJson('/api/telescope/jobs?limit=50')
-        ]);
-        const telescope = responses[1].map((job) => ({
-          ...job,
-          delivery_mode: 'telescope',
-          link: job.telegram_url,
-          progress_pct: job.progress,
-          object_url: job.result && job.result.public_url,
-          message: job.status === 'transferring'
-            ? 'Receiving Telegram media: ' + Number(job.progress || 0) + '% (' + (Number(job.streamed_bytes || 0) / 1048576).toFixed(1) + ' MiB received; ' + (Number(job.bytes_transferred || 0) / 1048576).toFixed(1) + ' MiB durable)'
-            : (job.status === 'retrying'
-              ? 'Telegram stream stalled; retrying automatically.'
-              : (job.last_error || String(job.status || '').replaceAll('_', ' ')))
-        }));
-        const list = responses[0].concat(telescope).sort((a, b) => Number(b.updated_at || b.updated_ts || 0) - Number(a.updated_at || a.updated_ts || 0));
+        const list = await apiJson('/api/jobs?limit=100');
         const active = list.filter((job) => !TERMINAL_STATUSES.has(job.status));
         const recent = list.filter((job) => TERMINAL_STATUSES.has(job.status));
         activeCountEl.textContent = active.length + ' active';
