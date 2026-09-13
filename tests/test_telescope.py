@@ -319,6 +319,59 @@ class TelescopeStateStoreTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(recovered["multipart_parts"][0]["PartNumber"], 1)
             self.assertEqual(recovered["bytes_transferred"], 32)
 
+    async def test_recovery_promotes_saved_object_result_instead_of_requeueing(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = StateStore(str(Path(temp_dir) / "state.db"))
+            await store.init()
+            await store.create_telescope_job(
+                {
+                    "job_id": "completed-object",
+                    "telegram_url": "https://t.me/demo/2",
+                    "reference": {"type": "public_channel_message", "username": "demo", "message_id": 2},
+                    "storage_target": "auto",
+                }
+            )
+            await store.update_telescope_job(
+                "completed-object",
+                status="queued",
+                progress=100,
+                bytes_total=42,
+                result_json={"public_url": "https://objects.example/videos/completed-object.mp4", "bytes": 42},
+            )
+
+            self.assertEqual(await store.recover_telescope_jobs(), 1)
+            recovered = await store.get_telescope_job("completed-object")
+
+            self.assertEqual(recovered["status"], "ready")
+            self.assertEqual(recovered["progress"], 100)
+            self.assertEqual(recovered["bytes_transferred"], 42)
+            self.assertEqual(await store.next_queued_telescope_jobs(1), [])
+
+    async def test_recovery_keeps_destroyed_object_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = StateStore(str(Path(temp_dir) / "state.db"))
+            await store.init()
+            await store.create_telescope_job(
+                {
+                    "job_id": "destroyed-object",
+                    "telegram_url": "https://t.me/demo/3",
+                    "reference": {"type": "public_channel_message", "username": "demo", "message_id": 3},
+                    "storage_target": "auto",
+                }
+            )
+            await store.update_telescope_job(
+                "destroyed-object",
+                status="destroyed",
+                progress=100,
+                result_json={"public_url": "https://objects.example/videos/destroyed-object.mp4", "bytes": 42},
+            )
+
+            self.assertEqual(await store.recover_telescope_jobs(), 0)
+            recovered = await store.get_telescope_job("destroyed-object")
+
+            self.assertEqual(recovered["status"], "destroyed")
+            self.assertEqual(await store.next_queued_telescope_jobs(1), [])
+
     async def test_portal_submission_is_idempotent_and_dashboard_job_has_no_callback(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             store = StateStore(str(Path(temp_dir) / "state.db"))

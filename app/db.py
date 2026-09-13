@@ -268,7 +268,7 @@ class StateStore:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 "UPDATE telescope_jobs SET status = 'queued', cancel_requested = 0, last_error = NULL, "
-                "completed_at = NULL, updated_at = ? WHERE job_id = ? AND status IN ('failed', 'cancelled', 'destroyed')",
+                "completed_at = NULL, updated_at = ? WHERE job_id = ? AND status IN ('failed', 'cancelled')",
                 (time.time(), job_id),
             )
             await db.commit()
@@ -276,14 +276,31 @@ class StateStore:
 
     async def recover_telescope_jobs(self) -> int:
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE telescope_jobs SET status = 'cancelled', completed_at = ?, updated_at = ? WHERE cancel_requested = 1 AND status NOT IN ('ready', 'failed', 'cancelled')", (time.time(), time.time()))
+            now = time.time()
+            await db.execute(
+                "UPDATE telescope_jobs SET status = 'cancelled', completed_at = ?, updated_at = ? "
+                "WHERE cancel_requested = 1 AND status NOT IN ('ready', 'failed', 'cancelled', 'destroyed')",
+                (now, now),
+            )
+            # A crash can occur after the verified object result is committed
+            # but before its terminal status is written. Never requeue a job
+            # which already owns a completed object; doing so causes duplicate
+            # work and makes the dashboard show a 100% object as queued.
+            completed = await db.execute(
+                "UPDATE telescope_jobs SET status = 'ready', progress = 100, "
+                "bytes_transferred = bytes_total, last_error = NULL, "
+                "completed_at = COALESCE(completed_at, ?), updated_at = ? "
+                "WHERE status NOT IN ('ready', 'failed', 'cancelled', 'destroyed') "
+                "AND result_json IS NOT NULL AND result_json NOT IN ('', 'null', '{}')",
+                (now, now),
+            )
             cursor = await db.execute(
                 "UPDATE telescope_jobs SET status = 'queued', updated_at = ? "
-                "WHERE status NOT IN ('queued', 'ready', 'failed', 'cancelled')",
-                (time.time(),),
+                "WHERE status NOT IN ('queued', 'ready', 'failed', 'cancelled', 'destroyed')",
+                (now,),
             )
             await db.commit()
-            return cursor.rowcount
+            return completed.rowcount + cursor.rowcount
 
     async def enqueue_telescope_callback(self, event: dict[str, Any]) -> None:
         now = time.time()
