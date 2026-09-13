@@ -1503,7 +1503,7 @@ def _html() -> str:
       }
 
       if (target.dataset.action === 'destroy-telescope' && target.dataset.jobId) {
-        if (!window.confirm('Clear this Telescope job\'s local temporary files? The completed remote object will remain available.')) return;
+        if (!window.confirm("Clear this Telescope job's local temporary files? The completed remote object will remain available.")) return;
         try {
           await apiJson('/api/telescope/jobs/' + encodeURIComponent(target.dataset.jobId) + '/destroy', { method: 'POST' });
           showNotice('Telescope temporary storage cleared.', 'ok');
