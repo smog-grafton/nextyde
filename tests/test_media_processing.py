@@ -194,7 +194,9 @@ class ChildProcessSafetyTests(unittest.TestCase):
                 with self.assertRaises(MediaProcessingCancelled):
                     _run([sys.executable, '-c', 'import os,time,pathlib; pathlib.Path(__import__("sys").argv[1]).write_text(str(os.getpid())); time.sleep(30)', str(pid_file)],
                          settings, 30, 'optimizing_video', None,
-                         lambda: time.monotonic() - started > .5, None, root)
+                         # Do not race the process startup: this test needs
+                         # the PID to prove that only the owned child died.
+                         lambda: pid_file.exists() and time.monotonic() - started > .5, None, root)
                 self.assertIsNone(sibling.poll())
                 with self.assertRaises(ProcessLookupError):
                     os.kill(int(pid_file.read_text()), 0)

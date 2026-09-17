@@ -216,7 +216,8 @@ class StateStore:
             db.row_factory = aiosqlite.Row
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
-                "SELECT * FROM telescope_jobs WHERE status = 'queued' AND cancel_requested = 0 ORDER BY created_at LIMIT ?",
+                "SELECT * FROM telescope_jobs WHERE status = 'queued' AND cancel_requested = 0 "
+                "ORDER BY COALESCE(CAST(json_extract(metadata_json, '$.queue_priority') AS INTEGER), 10) DESC, created_at LIMIT ?",
                 (max(1, limit),),
             )
             rows = await cursor.fetchall()

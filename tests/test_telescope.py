@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 from app.db import StateStore
 from app.object_storage import ObjectStorageManager, ObjectStorageTarget, S3MultipartUploader
-from app.telescope import TelescopeScheduler, TelescopeTransferStalledError
+from app.telescope import TelescopeScheduler, TelescopeSourceSizeLimitError, TelescopeTransferStalledError
 
 
 def target(key: str, *, priority: int = 0, used: int = 0) -> ObjectStorageTarget:
@@ -488,6 +488,16 @@ class TelescopeStateStoreTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(failed["attempts"], 2)
             finally:
                 await scheduler._http.aclose()
+
+class CreatorProgrammeSafetyTests(unittest.TestCase):
+    def test_creator_source_limit_is_rejected_before_download(self) -> None:
+        job = {"metadata": {"creator_max_source_bytes": 100}}
+
+        with self.assertRaisesRegex(TelescopeSourceSizeLimitError, "source limit"):
+            TelescopeScheduler._assert_creator_source_size(job, 101)
+
+    def test_admin_telescope_jobs_keep_existing_capacity_controls_without_creator_limit(self) -> None:
+        TelescopeScheduler._assert_creator_source_size({"metadata": {}}, 500 * 1024 * 1024 * 1024)
 
 
 if __name__ == "__main__":

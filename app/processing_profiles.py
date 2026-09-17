@@ -50,8 +50,15 @@ def normalize_processing_options(value: dict | None = None) -> dict:
     if options["audio_stream_index"] is not None and not 0 <= options["audio_stream_index"] <= 255:
         raise ValueError("audio_stream_index must be between 0 and 255")
     if mode != "custom":
-        options["target_height"], options["max_frame_rate"] = height, fps
-        options["fast_start"] = mode != "keep_original"
+        options["target_height"] = height
+        if mode in {"720p_balanced", "720p_compact", "720p_extra_compact", "1080p_balanced"}:
+            # Creator policy may choose a lower frame-rate ceiling, but never
+            # lift a compact profile above its established 30fps safety cap.
+            options["max_frame_rate"] = min(fps, options["max_frame_rate"] if options["max_frame_rate"] is not None else fps)
+            options["fast_start"] = bool(value.get("fast_start", True))
+        else:
+            options["max_frame_rate"] = fps
+            options["fast_start"] = mode != "keep_original"
     options["require_compatible"] = mode != "keep_original"
     if mode in {"auto", "fast_mp4", "keep_original"}:
         options["rf"] = rf

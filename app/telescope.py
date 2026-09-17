@@ -41,6 +41,10 @@ class TelescopeDiskCapacityError(RuntimeError):
     """Temporary storage cannot safely accommodate a staged media job."""
 
 
+class TelescopeSourceSizeLimitError(RuntimeError):
+    """A Creator Program source exceeds its administrator-owned size ceiling."""
+
+
 class TelescopeScheduler:
     """Durable acquisition, media preparation and verified object delivery."""
 
@@ -116,10 +120,16 @@ class TelescopeScheduler:
         existing = await self.store.get_telescope_job(job_id)
         if existing is not None:
             return existing
+        # Queue priority is assigned by the trusted portal policy, never by a
+        # browser field. Keep it in durable metadata so retries retain it.
+        job_metadata = dict(metadata or {})
+        raw_priority = job_metadata.get("creator_processing_priority", job_metadata.get("queue_priority", "standard"))
+        priority = {"standard": 10, "high": 20, "managed": 30}.get(str(raw_priority).lower(), 10)
+        job_metadata["queue_priority"] = priority
         job = await self.store.create_telescope_job({
             "job_id": job_id, "telegram_url": reference.canonical_url(), "reference": reference.as_dict(),
             "portal_source_id": portal_source_id, "storage_target": requested,
-            "metadata": metadata or {}, "processing": options,
+            "metadata": job_metadata, "processing": options,
         })
         await self._emit_event(job, "accepted")
         self._wake.set()
@@ -311,6 +321,32 @@ class TelescopeScheduler:
             raise TelescopeDiskCapacityError(f"Insufficient temporary disk space: {available} bytes free; {pending + reserve} bytes required including active jobs and safety reserve.")
         self._disk_reservations[job_id] = required
 
+    @staticmethod
+    def _assert_creator_source_size(job: dict[str, Any], source_bytes: int) -> None:
+        """Reject an oversize creator file before a single Telegram byte is downloaded.
+
+        Portal writes this trusted value into metadata after applying its
+        Filament policy. Administrative Telescope jobs omit it and retain their
+        existing worker/disk safeguards.
+        """
+        metadata = job.get("metadata") or {}
+        raw_limit = metadata.get("creator_max_source_bytes") if isinstance(metadata, dict) else None
+        if isinstance(raw_limit, bool):
+            return
+        try:
+            limit = int(raw_limit)
+        except (TypeError, ValueError):
+            return
+        if limit <= 0 or source_bytes <= limit:
+            return
+
+        source_gib = source_bytes / (1024 ** 3)
+        limit_gib = limit / (1024 ** 3)
+        raise TelescopeSourceSizeLimitError(
+            f"Creator source is {source_gib:.2f} GiB, above this programme's {limit_gib:.2f} GiB source limit. "
+            "Ask NaraBox support to review the source limit or submit a smaller file."
+        )
+
     async def _blocking(self, fn, *args, cancel_event: asyncio.Event, **kwargs):
         # Cancelling to_thread alone leaves its subprocess running. Signal the
         # owning thread and join it before releasing resource and file locks.
@@ -348,6 +384,7 @@ class TelescopeScheduler:
             total = int(getattr(message.file, "size", 0) or 0)
             if total <= 0:
                 raise RuntimeError("Telegram did not provide a valid media size.")
+            self._assert_creator_source_size(job, total)
             original_name = storage_safe_filename(self.worker._extract_file_name(message) or f"message-{reference.message_id}.bin")
             mime = str(getattr(message.file, "mime_type", "") or "application/octet-stream")
             # Switching an old direct-stream job to staged media must abandon
