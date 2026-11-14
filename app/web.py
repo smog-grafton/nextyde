@@ -35,6 +35,7 @@ telescope_start_task: asyncio.Task[None] | None = None
 
 TERMINAL_STATUSES = {"done", "ready", "failed", "cancelled", "destroyed", "expired"}
 CANCELLABLE_STATUSES = {"queued", "resolving", "finding_message", "downloading", "waiting_to_prepare", "preparing", "uploading"}
+RECOVERABLE_MEDIA_EXTENSIONS = {".mp4", ".mkv", ".avi", ".mov", ".m4v", ".webm", ".mpeg", ".mpg", ".ts", ".m2ts"}
 
 
 def _touch_job(job: dict) -> None:
@@ -136,18 +137,36 @@ def _pick_recovered_file(files: list[Path]) -> Path:
     return max(files, key=lambda path: path.stat().st_mtime)
 
 
+def _recoverable_download_files(directory: Path) -> list[Path]:
+    """Return only completed legacy media, never Telescope checkpoints/partials."""
+    files: list[Path] = []
+    for path in directory.rglob("*"):
+        if not path.is_file() or path.is_symlink() or path.suffix.lower() not in RECOVERABLE_MEDIA_EXTENSIONS:
+            continue
+        # `output.part.mp4` is a live/interrupted encoder work file, not a
+        # downloadable result. Treat every dotted `.part` component as partial.
+        if ".part." in path.name.lower() or path.name.lower().endswith(".part"):
+            continue
+        files.append(path)
+    return files
+
+
 def _recover_download_only_jobs(current_worker: TelegramPipeWorker) -> int:
     recovered = 0
     if not current_worker.settings.temp_dir.exists():
         return recovered
 
     for child in current_worker.settings.temp_dir.iterdir():
-        if not child.is_dir():
+        # Telescope persists its own state and working files in this root. Its
+        # durable scheduler recovers/cancels them; treating a checkpoint as a
+        # legacy download creates a fake `telescope` job that cannot be safely
+        # served or destroyed.
+        if child.name == "telescope" or not child.is_dir() or child.is_symlink():
             continue
         job_id = child.name
         if job_id in jobs:
             continue
-        files = [path for path in child.rglob("*") if path.is_file()]
+        files = _recoverable_download_files(child)
         if not files:
             continue
         latest = _pick_recovered_file(files)
@@ -885,7 +904,13 @@ async def api_telescope_destroy(job_id: str):
         raise HTTPException(503, detail="Telescope is unavailable.")
     if not await telescope_scheduler.destroy(job_id):
         raise HTTPException(409, detail="Only terminal Telescope jobs can have their temporary storage cleared.")
-    return {"ok": True, "job_id": job_id, "status": "destroyed"}
+    # Destroying only removes the local working directory. The verified object
+    # result is deliberately retained so Portal can still sync/activate a
+    # completed source if its ready callback was missed before cleanup.
+    job = await telescope_scheduler.store.get_telescope_job(job_id)
+    if job is None:  # Defensive: a successful destroy never deletes its row.
+        raise HTTPException(404, detail="Telescope job not found after cleanup.")
+    return {"ok": True, **_public_telescope_job(job)}
 
 
 @app.post("/api/worker/telescope/jobs/{job_id}/destroy")

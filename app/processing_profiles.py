@@ -21,7 +21,7 @@ def normalize_processing_options(value: dict | None = None) -> dict:
         value = {}
     if not isinstance(value, dict):
         raise ValueError("Processing instructions must be an object")
-    allowed = {"mode", "target_height", "rf", "max_frame_rate", "fast_start", "encoder_preset", "require_compatible", "audio_stream_index"}
+    allowed = {"mode", "target_height", "rf", "max_frame_rate", "fast_start", "encoder_preset", "require_compatible", "audio_stream_index", "ignore_dimensions"}
     unknown = set(value) - allowed
     if unknown:
         raise ValueError(f"Unknown processing option: {', '.join(sorted(unknown))}")
@@ -31,7 +31,8 @@ def normalize_processing_options(value: dict | None = None) -> dict:
     height, rf, fps = _PROFILE_DEFAULTS[mode]
     options = {"mode": mode, "target_height": height, "rf": rf, "max_frame_rate": fps,
                "fast_start": mode != "keep_original", "encoder_preset": "veryfast",
-               "require_compatible": mode != "keep_original", "audio_stream_index": None}
+               "require_compatible": mode != "keep_original", "audio_stream_index": None,
+               "ignore_dimensions": False}
     options.update(value)
     for key in ("target_height", "rf", "max_frame_rate", "audio_stream_index"):
         if options[key] is not None and type(options[key]) is not int:
@@ -44,7 +45,7 @@ def normalize_processing_options(value: dict | None = None) -> dict:
         raise ValueError("Unsupported maximum frame rate")
     if not isinstance(options["encoder_preset"], str) or options["encoder_preset"] not in ENCODER_PRESETS:
         raise ValueError("Unsupported encoder speed preset")
-    for key in ("fast_start", "require_compatible"):
+    for key in ("fast_start", "require_compatible", "ignore_dimensions"):
         if type(options[key]) is not bool:
             raise ValueError(f"{key} must be a boolean")
     if options["audio_stream_index"] is not None and not 0 <= options["audio_stream_index"] <= 255:

@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+import json
 import logging
 import os
 from pathlib import PurePosixPath
 from typing import Any, AsyncIterator, Awaitable, Callable
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote
+from urllib.request import Request, urlopen
 
 import boto3
 from botocore.client import Config
@@ -127,9 +130,110 @@ def load_storage_targets() -> dict[str, ObjectStorageTarget]:
     }
 
 
+def _managed_target_from_payload(payload: Any) -> ObjectStorageTarget | None:
+    if not isinstance(payload, dict):
+        return None
+
+    required = ("key", "endpoint", "region", "bucket", "access_key_id", "secret_access_key")
+    if any(not str(payload.get(field) or "").strip() for field in required):
+        return None
+
+    return ObjectStorageTarget(
+        key=str(payload["key"]).strip(),
+        label=str(payload.get("label") or payload["key"]).strip(),
+        provider=str(payload.get("provider") or "s3_compatible").strip(),
+        endpoint=str(payload["endpoint"]).strip(),
+        region=str(payload["region"]).strip(),
+        bucket=str(payload["bucket"]).strip(),
+        public_url=str(payload.get("public_url") or "").strip(),
+        path_prefix=str(payload.get("path_prefix") or "videos").strip("/"),
+        access_key_id=str(payload["access_key_id"]).strip(),
+        secret_access_key=str(payload["secret_access_key"]).strip(),
+        use_path_style_endpoint=bool(payload.get("use_path_style_endpoint", True)),
+        enabled=bool(payload.get("enabled", False)),
+        writable=bool(payload.get("writable", False)),
+        priority=int(payload.get("priority") or 0),
+        capacity_bytes=int(payload.get("capacity_bytes") or 0),
+        reserve_percent=float(payload.get("reserve_percent") or 0),
+        known_used_bytes=int(payload.get("known_used_bytes") or 0),
+    )
+
+
+def load_portal_managed_target(key: str) -> ObjectStorageTarget | None:
+    """Fetch a Filament-managed target only over the worker-only portal API.
+
+    Static Contabo/R2 targets still come from Teletyde's own environment. This
+    path is exclusively for a target added later in Portal, and keeps its
+    credentials in memory rather than copying them into Teletyde's `.env` or
+    SQLite job state.
+    """
+    base_url = os.getenv("PORTAL_STORAGE_TARGETS_URL", "").strip().rstrip("/")
+    token = os.getenv("PORTAL_STORAGE_TARGETS_TOKEN", "").strip()
+    if not base_url or not token:
+        return None
+
+    request = Request(
+        f"{base_url}/{quote(key, safe='')}",
+        headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=10) as response:  # noqa: S310 - URL is trusted worker env configuration.
+            data = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+        LOGGER.warning("Unable to load managed storage target %s from Portal: %s", key, exc)
+        return None
+
+    target = _managed_target_from_payload(data.get("target") if isinstance(data, dict) else None)
+    if target is None or target.key != key:
+        LOGGER.warning("Portal returned an invalid managed storage target for %s", key)
+        return None
+
+    return target
+
+
+def load_portal_managed_targets() -> dict[str, ObjectStorageTarget]:
+    """Load all enabled Portal-managed targets for automatic selection."""
+    base_url = os.getenv("PORTAL_STORAGE_TARGETS_URL", "").strip().rstrip("/")
+    token = os.getenv("PORTAL_STORAGE_TARGETS_TOKEN", "").strip()
+    if not base_url or not token:
+        return {}
+
+    request = Request(
+        base_url,
+        headers={"Accept": "application/json", "Authorization": f"Bearer {token}"},
+        method="GET",
+    )
+    try:
+        with urlopen(request, timeout=10) as response:  # noqa: S310 - URL is trusted worker env configuration.
+            data = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, ValueError) as exc:
+        LOGGER.warning("Unable to load managed storage targets from Portal: %s", exc)
+        return {}
+
+    raw_targets = data.get("targets") if isinstance(data, dict) else []
+    if not isinstance(raw_targets, list):
+        return {}
+
+    targets: dict[str, ObjectStorageTarget] = {}
+    for raw_target in raw_targets:
+        target = _managed_target_from_payload(raw_target)
+        if target is not None:
+            targets[target.key] = target
+    return targets
+
+
 class ObjectStorageManager:
-    def __init__(self, targets: dict[str, ObjectStorageTarget] | None = None) -> None:
+    def __init__(
+        self,
+        targets: dict[str, ObjectStorageTarget] | None = None,
+        managed_target_loader: Callable[[str], ObjectStorageTarget | None] | None = None,
+        managed_targets_loader: Callable[[], dict[str, ObjectStorageTarget]] | None = None,
+    ) -> None:
         self.targets = targets if targets is not None else load_storage_targets()
+        self.managed_target_loader = managed_target_loader or load_portal_managed_target
+        self.managed_targets_loader = managed_targets_loader or load_portal_managed_targets
+        self._managed_targets_loaded = False
         self._reservations: dict[str, tuple[str, int]] = {}
         self._committed: dict[str, int] = {}
 
@@ -162,11 +266,17 @@ class ObjectStorageManager:
         if key != "auto":
             target = self.targets.get(key)
             if target is None:
+                target = self.managed_target_loader(key)
+                if target is not None:
+                    self.targets[key] = target
+            if target is None:
                 raise RuntimeError(f"Unknown Telescope storage target: {key}")
             self._assert_usable(target, expected_bytes)
             if not self._available(target, expected_bytes):
                 raise RuntimeError(f"Telescope storage target [{key}] has insufficient safe capacity after active uploads.")
             return target
+
+        self._load_managed_targets_once()
 
         candidates = [
             target
@@ -183,6 +293,15 @@ class ObjectStorageManager:
             key=lambda target: (target.priority, target.capacity_bytes - target.known_used_bytes),
             reverse=True,
         )[0]
+
+    def _load_managed_targets_once(self) -> None:
+        if self._managed_targets_loaded:
+            return
+
+        self._managed_targets_loaded = True
+        for key, target in self.managed_targets_loader().items():
+            if key not in self.targets:
+                self.targets[key] = target
 
     @staticmethod
     def _assert_usable(target: ObjectStorageTarget, expected_bytes: int) -> None:

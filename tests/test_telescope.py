@@ -53,6 +53,29 @@ class ObjectStorageManagerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "safe capacity"):
             manager.resolve("full", 100)
 
+    def test_unknown_target_can_be_loaded_from_the_private_portal_registry(self) -> None:
+        calls: list[str] = []
+
+        def load_from_portal(key: str) -> ObjectStorageTarget | None:
+            calls.append(key)
+            return target(key, priority=50) if key == "future_r2" else None
+
+        manager = ObjectStorageManager({}, managed_target_loader=load_from_portal)
+
+        self.assertEqual(manager.resolve("future_r2", 100).key, "future_r2")
+        self.assertEqual(calls, ["future_r2"])
+        # It is cached in memory for the rest of this worker process.
+        self.assertEqual(manager.resolve("future_r2", 100).key, "future_r2")
+        self.assertEqual(calls, ["future_r2"])
+
+    def test_auto_selection_includes_managed_targets_loaded_from_portal(self) -> None:
+        manager = ObjectStorageManager(
+            {"legacy": target("legacy", priority=20)},
+            managed_targets_loader=lambda: {"future_r2": target("future_r2", priority=100)},
+        )
+
+        self.assertEqual(manager.resolve("auto", 100).key, "future_r2")
+
     def test_public_url_encodes_filename_without_destroying_path(self) -> None:
         storage = target("demo")
         self.assertEqual(

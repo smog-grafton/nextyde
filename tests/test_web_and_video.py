@@ -157,6 +157,7 @@ class WebBehaviorTests(unittest.IsolatedAsyncioTestCase):
         self.old_worker = web.worker
         self.old_app_settings = web.app_settings
         self.old_authorized = web.authorized
+        self.old_telescope_scheduler = web.telescope_scheduler
         self.old_jobs = dict(web.jobs)
         web.jobs.clear()
         self.temp_dir_ctx = tempfile.TemporaryDirectory()
@@ -172,6 +173,7 @@ class WebBehaviorTests(unittest.IsolatedAsyncioTestCase):
         web.worker = self.old_worker
         web.app_settings = self.old_app_settings
         web.authorized = self.old_authorized
+        web.telescope_scheduler = self.old_telescope_scheduler
         self.temp_dir_ctx.cleanup()
 
     def test_normalize_links_splits_multiline_and_dedupes(self) -> None:
@@ -318,6 +320,36 @@ class WebBehaviorTests(unittest.IsolatedAsyncioTestCase):
 
         temp_url = web._build_temp_url(web.worker, web.jobs["job-2"])
         self.assertEqual(temp_url, "/api/temp/job-2/movie-final-cut.mkv")
+
+    def test_restart_recovery_ignores_telescope_work_and_partial_files(self) -> None:
+        telescope_partial = self.temp_dir / "telescope" / "job-hash" / "output.part.mp4"
+        telescope_partial.parent.mkdir(parents=True, exist_ok=True)
+        telescope_partial.write_bytes(b"incomplete")
+        interrupted = self.temp_dir / "legacy-partial" / "movie.part.mp4"
+        interrupted.parent.mkdir(parents=True, exist_ok=True)
+        interrupted.write_bytes(b"incomplete")
+        completed = self.temp_dir / "legacy-completed" / "movie.mp4"
+        completed.parent.mkdir(parents=True, exist_ok=True)
+        completed.write_bytes(b"video")
+
+        self.assertEqual(web._recover_download_only_jobs(web.worker), 1)
+        self.assertNotIn("telescope", web.jobs)
+        self.assertNotIn("legacy-partial", web.jobs)
+        self.assertEqual(web.jobs["legacy-completed"]["temp_path"], str(completed))
+
+    async def test_telescope_destroy_returns_preserved_object_result(self) -> None:
+        result = {"public_url": "https://cdn.example/videos/movie.mp4", "bytes": 42}
+        store = SimpleNamespace(get_telescope_job=AsyncMock(return_value={
+            "job_id": "ready-object", "status": "destroyed", "result": result,
+            "metadata": {}, "attempts": 1, "bytes_transferred": 42,
+        }))
+        web.telescope_scheduler = SimpleNamespace(destroy=AsyncMock(return_value=True), store=store)
+
+        response = await web.api_telescope_destroy("ready-object")
+
+        self.assertTrue(response["ok"])
+        self.assertEqual(response["status"], "destroyed")
+        self.assertEqual(response["result"]["public_url"], result["public_url"])
 
     async def test_signed_fetch_url_resolves_real_file(self) -> None:
         file_path = self.temp_dir / "watcher" / "movie-final-cut.mkv"

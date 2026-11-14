@@ -13,7 +13,8 @@
         "fast_start": true,
         "encoder_preset": "veryfast",
         "require_compatible": true,
-        "audio_stream_index": null
+        "audio_stream_index": null,
+        "ignore_dimensions": false
       }
     },
     {
@@ -28,7 +29,8 @@
         "fast_start": true,
         "encoder_preset": "veryfast",
         "require_compatible": true,
-        "audio_stream_index": null
+        "audio_stream_index": null,
+        "ignore_dimensions": false
       }
     },
     {
@@ -43,7 +45,8 @@
         "fast_start": true,
         "encoder_preset": "veryfast",
         "require_compatible": true,
-        "audio_stream_index": null
+        "audio_stream_index": null,
+        "ignore_dimensions": false
       }
     },
     {
@@ -58,7 +61,8 @@
         "fast_start": true,
         "encoder_preset": "veryfast",
         "require_compatible": true,
-        "audio_stream_index": null
+        "audio_stream_index": null,
+        "ignore_dimensions": false
       }
     },
     {
@@ -73,7 +77,8 @@
         "fast_start": true,
         "encoder_preset": "veryfast",
         "require_compatible": true,
-        "audio_stream_index": null
+        "audio_stream_index": null,
+        "ignore_dimensions": false
       }
     },
     {
@@ -88,7 +93,8 @@
         "fast_start": true,
         "encoder_preset": "veryfast",
         "require_compatible": true,
-        "audio_stream_index": null
+        "audio_stream_index": null,
+        "ignore_dimensions": false
       }
     },
     {
@@ -103,7 +109,8 @@
         "fast_start": false,
         "encoder_preset": "veryfast",
         "require_compatible": false,
-        "audio_stream_index": null
+        "audio_stream_index": null,
+        "ignore_dimensions": false
       }
     },
     {
@@ -118,7 +125,8 @@
         "fast_start": true,
         "encoder_preset": "veryfast",
         "require_compatible": true,
-        "audio_stream_index": null
+        "audio_stream_index": null,
+        "ignore_dimensions": false
       }
     },
     {
@@ -129,7 +137,8 @@
         "max_frame_rate": 25,
         "encoder_preset": "fast",
         "fast_start": false,
-        "audio_stream_index": 2
+        "audio_stream_index": 2,
+        "ignore_dimensions": true
       },
       "expected": {
         "mode": "custom",
@@ -139,7 +148,8 @@
         "fast_start": false,
         "encoder_preset": "fast",
         "require_compatible": true,
-        "audio_stream_index": 2
+        "audio_stream_index": 2,
+        "ignore_dimensions": true
       }
     }
   ]

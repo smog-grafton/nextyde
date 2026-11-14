@@ -9,6 +9,7 @@ import unittest
 from dataclasses import replace
 from unittest.mock import patch
 
+import app.media_processing as media_processing
 from app.media_processing import (analyze_media_for_processing, prepare_media_for_processing,
                                   validate_output, MediaProcessingCancelled)
 from app.media_probe import probe_media
@@ -87,6 +88,35 @@ class RealMediaTests(unittest.TestCase):
         result = self.prepare(source)
         self.assertEqual(result.method, 'video_transcode')
         self.assertEqual(result.output_probe.video.pix_fmt, 'yuv420p')
+
+    def test_administrator_can_ignore_inconsistent_display_dimensions(self):
+        source = self.fixture('ignore-dimensions', ['-vf', 'scale=320:180,setsar=4/3', '-c:v', 'libx265',
+                                                    '-preset', 'ultrafast', '-x265-params', 'pools=1:frame-threads=1',
+                                                    '-pix_fmt', 'yuv420p10le', '-c:a', 'copy'])
+        result = self.prepare(source, {'ignore_dimensions': True})
+
+        self.assertTrue(result.decision.ignore_source_dimensions)
+        self.assertAlmostEqual(result.output_probe.video.width / result.output_probe.video.height, 16 / 9, places=2)
+
+    def test_display_aspect_validation_retries_with_coded_dimensions(self):
+        source = self.fixture('aspect-retry', ['-vf', 'scale=320:180,setsar=4/3', '-c:v', 'libx265',
+                                               '-preset', 'ultrafast', '-x265-params', 'pools=1:frame-threads=1',
+                                               '-pix_fmt', 'yuv420p10le', '-c:a', 'copy'])
+        real_validate = media_processing.validate_output
+        decisions = []
+
+        def fail_first_aspect_check(source_probe, output_probe, options, decision):
+            decisions.append(decision)
+            if len(decisions) == 1:
+                raise RuntimeError('Output display aspect ratio differs from the source.')
+            return real_validate(source_probe, output_probe, options, decision)
+
+        with patch('app.media_processing.validate_output', side_effect=fail_first_aspect_check):
+            result = self.prepare(source)
+
+        self.assertEqual(len(decisions), 2)
+        self.assertTrue(result.decision.ignore_source_dimensions)
+        self.assertTrue(result.metadata()['source_dimensions_ignored'])
 
     def test_multitrack_requires_explicit_or_unique_default(self):
         source = self.fixture('tracks', ['-map', '0:v:0', '-map', '0:a:0', '-map', '0:a:0',
@@ -168,7 +198,7 @@ class ProfileTests(unittest.TestCase):
     def test_untrusted_options_are_rejected(self):
         for options in ({'command': 'touch /tmp/unsafe'}, {'rf': 99}, {'rf': float('nan')},
                         {'encoder_preset': '; echo unsafe'}, {'audio_stream_index': -1},
-                        {'mode': []}, {'fast_start': 'false'}, {'rf': True}):
+                        {'mode': []}, {'fast_start': 'false'}, {'ignore_dimensions': 'true'}, {'rf': True}):
             with self.subTest(options=options), self.assertRaises(ValueError):
                 normalize_processing_options(options)
 
@@ -176,6 +206,8 @@ class ProfileTests(unittest.TestCase):
         self.assertEqual(normalize_processing_options({'mode': '720p_compact'})['rf'], 26)
         self.assertEqual(normalize_processing_options({'mode': 'auto', 'rf': 29})['rf'], 23)
         self.assertTrue(normalize_processing_options({'mode': 'auto', 'fast_start': False})['fast_start'])
+        self.assertFalse(normalize_processing_options({'mode': 'auto'})['ignore_dimensions'])
+        self.assertTrue(normalize_processing_options({'mode': '720p_compact', 'ignore_dimensions': True})['ignore_dimensions'])
 
 
 class ChildProcessSafetyTests(unittest.TestCase):

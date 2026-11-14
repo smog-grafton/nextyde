@@ -39,6 +39,10 @@ class ProcessingDecision:
     encodes_video: bool
     encodes_audio: bool
     selected_audio_stream_index: int | None
+    # Use decoded/coded frame dimensions when source display metadata is
+    # internally inconsistent. This never relaxes codec, duration or stream
+    # validation; it only avoids trusting a broken declared display ratio.
+    ignore_source_dimensions: bool = False
 
 
 @dataclass
@@ -80,6 +84,7 @@ class MediaProcessingResult:
                 'selected_audio_stream_index': self.decision.selected_audio_stream_index,
                 'video_copied': not self.decision.encodes_video, 'audio_copied': not self.decision.encodes_audio,
                 'reason': self.decision.reason, 'reused_output': self.reused,
+                'source_dimensions_ignored': self.decision.ignore_source_dimensions,
                 'subtitle_policy': 'preserved_original' if self.processing['mode'] == 'keep_original' else 'external_tracks_only',
                 'validation': {'passed': True, 'timestamp_check': 'first_3_seconds',
                                'duration_compared': True, 'fast_start': self.output_probe.fast_start,
@@ -160,6 +165,10 @@ def analyze_media_for_processing(settings, input_path, processing=None, progress
     if should_cancel and should_cancel():
         raise MediaProcessingCancelled('Media inspection cancelled.')
     decision = decide(source, options)
+    if options['ignore_dimensions']:
+        decision = ProcessingDecision(
+            **{**asdict(decision), 'ignore_source_dimensions': True},
+        )
     LOG.info('Decision method=%s profile=%s selected_audio=%s source=%s reason=%s',
              decision.method, options['mode'], decision.selected_audio_stream_index,
              json.dumps(source.metadata()), decision.reason)
@@ -185,7 +194,8 @@ def validate_output(source, output, options, decision):
             except (ValueError, ZeroDivisionError):
                 ratio = video.width / video.height
             return 1 / ratio if abs(video.rotation) % 180 == 90 else ratio
-        if abs(display_ratio(output.video) / display_ratio(source.video) - 1) > .02:
+        if (not getattr(decision, 'ignore_source_dimensions', False)
+                and abs(display_ratio(output.video) / display_ratio(source.video) - 1) > .02):
             raise RuntimeError('Output display aspect ratio differs from the source.')
         if not output.is_mp4 or not _video_compatible(output) or output.video.codec_tag != 'avc1':
             raise RuntimeError('Output violates MP4/H.264 8-bit universal compatibility contract.')
@@ -201,13 +211,17 @@ def validate_output(source, output, options, decision):
             raise RuntimeError('Output exceeds requested maximum frame rate.')
 
 
-def _dimensions(source, options):
+def _dimensions(source, options, decision=None):
     v = source.video
-    try:
-        sar = float(Fraction((v.sample_aspect_ratio or '1:1').replace(':', '/')))
-    except (ValueError, ZeroDivisionError):
-        sar = 1.0
-    width, height = v.width * sar, v.height
+    if getattr(decision, 'ignore_source_dimensions', False):
+        # The actual decoded frame is safer than contradictory DAR/SAR tags.
+        width, height = v.width, v.height
+    else:
+        try:
+            sar = float(Fraction((v.sample_aspect_ratio or '1:1').replace(':', '/')))
+        except (ValueError, ZeroDivisionError):
+            sar = 1.0
+        width, height = v.width * sar, v.height
     if abs(v.rotation) % 180 == 90:
         width, height = height, width
     cap = min(1080, options['target_height'] or 1080)
@@ -226,7 +240,7 @@ def _ffmpeg_command(binary, source, output, options, decision, settings):
         cmd += ['-map', f'0:{decision.selected_audio_stream_index}']
     cmd += ['-sn', '-dn', '-map_metadata', '-1', '-map_chapters', '-1']
     if decision.encodes_video:
-        width, height = _dimensions(source, options)
+        width, height = _dimensions(source, options, decision)
         filters = []
         if source.video.field_order not in (None, 'unknown', 'progressive'):
             filters += ['yadif=mode=send_frame:parity=auto:deint=interlaced']
@@ -255,7 +269,7 @@ def _ffmpeg_command(binary, source, output, options, decision, settings):
 
 def _handbrake_command(binary, source, output, options, decision, settings):
     capabilities = inspect_handbrake(binary)
-    width, height = _dimensions(source, options)
+    width, height = _dimensions(source, options, decision)
     cmd = [binary, '--input', str(source.path), '--output', str(output), '--format', 'av_mp4',
            '--encoder', 'x264', '--encoder-preset', options['encoder_preset'],
            '--quality', str(options['rf']), '--encoder-profile', 'high', '--encoder-level', '4.2',
@@ -367,6 +381,23 @@ def _fingerprint(source, options):
                                       'options': options, 'contract': 1}, sort_keys=True).encode()).hexdigest()
 
 
+def _is_display_aspect_ratio_failure(error: Exception) -> bool:
+    return 'output display aspect ratio differs from the source' in str(error).lower()
+
+
+def _coded_dimension_fallback(decision: ProcessingDecision) -> ProcessingDecision:
+    """Return a safe H.264 retry plan for inconsistent source display tags."""
+    return ProcessingDecision(
+        method='full_transcode' if decision.encodes_audio else 'video_transcode',
+        reason=('Source display dimensions were inconsistent; retried from decoded '
+                'pixel dimensions while preserving the compatibility checks.'),
+        encodes_video=True,
+        encodes_audio=decision.encodes_audio,
+        selected_audio_stream_index=decision.selected_audio_stream_index,
+        ignore_source_dimensions=True,
+    )
+
+
 def prepare_media_for_processing(settings, input_path, processing=None, analysis=None,
                                  progress_callback=None, should_cancel=None, process_lock_fd=None, allow_video_fallback=True):
     started = time.monotonic()
@@ -421,26 +452,46 @@ def prepare_media_for_processing(settings, input_path, processing=None, analysis
             final_probe = probe_media(probe_binary, partial)
             validate_output(source, final_probe, options, decision)
         except RuntimeError as exc:
-            if (decision.encodes_video or isinstance(exc, MediaProcessingCancelled)
+            if _is_display_aspect_ratio_failure(exc) and not decision.ignore_source_dimensions:
+                # Telegram files can carry contradictory DAR/SAR/container
+                # tags. A failed display-ratio comparison is not evidence that
+                # the source itself is unusable. Re-encode once with FFmpeg
+                # using its decoded frame dimensions, while retaining every
+                # other duration, stream, codec and fast-start guardrail.
+                if not decision.encodes_video and not allow_video_fallback:
+                    raise MediaVideoRepairRequired(str(exc)) from exc
+                LOG.warning('Display-aspect validation failed; retrying from coded frame dimensions: %s', exc)
+                partial.unlink(missing_ok=True)
+                decision = _coded_dimension_fallback(decision)
+                cmd = _ffmpeg_command(settings.ffmpeg_binary or tools.ffmpeg.path, source, partial, options, decision, settings)
+                if progress_callback:
+                    progress_callback('optimizing_video', {'progress_pct': 0})
+                _run(cmd, settings, source.duration_seconds, 'optimizing_video', progress_callback, should_cancel, process_lock_fd, input_path.parent)
+                if progress_callback:
+                    progress_callback('validating', {'progress_pct': 98})
+                final_probe = probe_media(probe_binary, partial)
+                validate_output(source, final_probe, options, decision)
+            elif (decision.encodes_video or isinstance(exc, MediaProcessingCancelled)
                     or 'disk space' in str(exc).lower() or 'timed out' in str(exc).lower()):
                 raise
-            # A structural stream-copy failure gets one controlled video repair.
-            # User cancellation, capacity failures, and failed encodes never loop.
-            if not allow_video_fallback:
-                raise MediaVideoRepairRequired(str(exc)) from exc
-            LOG.warning('Stream-copy repair failed; trying compatibility encode: %s', exc)
-            partial.unlink(missing_ok=True)
-            decision = ProcessingDecision('full_transcode' if decision.encodes_audio else 'video_transcode',
-                                          'Stream-copy validation failed; compatibility repair required.',
-                                          True, decision.encodes_audio, decision.selected_audio_stream_index)
-            cmd = _ffmpeg_command(settings.ffmpeg_binary or tools.ffmpeg.path, source, partial, options, decision, settings)
-            if progress_callback:
-                progress_callback('optimizing_video', {'progress_pct': 0})
-            _run(cmd, settings, source.duration_seconds, 'optimizing_video', progress_callback, should_cancel, process_lock_fd, input_path.parent)
-            if progress_callback:
-                progress_callback('validating', {'progress_pct': 98})
-            final_probe = probe_media(probe_binary, partial)
-            validate_output(source, final_probe, options, decision)
+            else:
+                # A structural stream-copy failure gets one controlled video repair.
+                # User cancellation, capacity failures, and failed encodes never loop.
+                if not allow_video_fallback:
+                    raise MediaVideoRepairRequired(str(exc)) from exc
+                LOG.warning('Stream-copy repair failed; trying compatibility encode: %s', exc)
+                partial.unlink(missing_ok=True)
+                decision = ProcessingDecision('full_transcode' if decision.encodes_audio else 'video_transcode',
+                                              'Stream-copy validation failed; compatibility repair required.',
+                                              True, decision.encodes_audio, decision.selected_audio_stream_index)
+                cmd = _ffmpeg_command(settings.ffmpeg_binary or tools.ffmpeg.path, source, partial, options, decision, settings)
+                if progress_callback:
+                    progress_callback('optimizing_video', {'progress_pct': 0})
+                _run(cmd, settings, source.duration_seconds, 'optimizing_video', progress_callback, should_cancel, process_lock_fd, input_path.parent)
+                if progress_callback:
+                    progress_callback('validating', {'progress_pct': 98})
+                final_probe = probe_media(probe_binary, partial)
+                validate_output(source, final_probe, options, decision)
         if should_cancel and should_cancel():
             raise MediaProcessingCancelled('Media processing cancelled.')
         # Durably commit file before recording reusable validated output.
